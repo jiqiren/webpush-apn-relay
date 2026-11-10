@@ -21,6 +21,63 @@ only development will work.
 
 ## Docker
 
+There are two ways to build an image. Use the second one if you are building on
+a machine whose architecture differs from your deploy target.
+
+### In-container build (`Dockerfile`)
+
+The default path, and what CI uses. Multi-stage: `golang:1.26-trixie` compiles
+the service, and the result is copied into `gcr.io/distroless/base-debian13`.
+
+```sh
+podman build -t webpush-apn-relay .
+```
+
+This builds for the architecture of the build host. Add `--platform linux/amd64`
+to target a different architecture, but see the caveat below before doing so.
+
+### Cross-compiled build (`Dockerfile.cross` + `build.sh`)
+
+Cross-compiles with the host Go toolchain (`GOOS`/`GOARCH`), then copies the
+static binary into a distroless image. There is no build stage, so no compiler
+runs under emulation.
+
+```sh
+./build.sh              # linux/amd64
+./build.sh arm64        # linux/arm64
+./build.sh amd64 --no-image   # compile only
+```
+
+Images are tagged `webpush-apn-relay:<version>-linux-<arch>` so that building
+for several architectures does not overwrite earlier results. The script also
+asserts that the compiled binary matches the requested architecture and is
+statically linked, which catches a stale binary before it is baked into an image.
+
+This is much faster than an emulated build, because the Go compiler runs natively.
+
+**Caveat when cross-building with `Dockerfile`:** running the amd64 Go compiler
+under QEMU on an arm64 host is unreliable. `go mod download` fails
+non-deterministically with GC faults (`sweep increased allocation count`, or a
+`SIGSEGV` at a garbage address) using go1.26/go1.27 with qemu-user-static 10.0.x.
+This is a defect in the emulation of the GC's concurrent marking, not in this
+repository; `go version` succeeds and the same build passes on native amd64
+hardware, which is why CI is unaffected. `build.sh` avoids the problem by not
+emulating at all.
+
+### Runtime requirement
+
+Whichever image you build, the service exits immediately unless it can load
+APNs credentials. It reads the first defined of `TOKEN_AUTH_KEY_FILENAME`,
+`P12_BASE64`, then `P12_FILENAME` (defaulting to `toot-relay.p12`, which is not
+committed). Without one, startup ends with:
+
+```
+level=fatal msg="Error loading certificate file: open toot-relay.p12: no such file or directory"
+```
+
+A Datadog agent is not required. If `localhost:8126` is unreachable the tracer
+logs a warning and continues.
+
 A simple Dockerfile is included for running the service containerised. It has been
 tested with the following hosting solutions:
 

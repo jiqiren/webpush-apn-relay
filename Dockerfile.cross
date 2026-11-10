@@ -1,0 +1,25 @@
+# Runtime-only image. The binary is cross-compiled on the host by build.sh,
+# so no Go toolchain or QEMU emulation is needed inside the build.
+#
+# NOTE: the base image is pinned to the target platform so the resulting image
+# manifest matches the binary that is copied in. TARGETPLATFORM is supplied
+# automatically by the builder from --platform; build.sh also passes --platform
+# on FROM for builders that ignore the outer flag.
+ARG TARGETPLATFORM
+FROM --platform=${TARGETPLATFORM} gcr.io/distroless/base-debian13
+
+COPY webpush-apn-relay /webpush-apn-relay
+
+ADD cas.crt /cas.crt
+ENV CA_FILENAME /cas.crt
+
+ARG GIT_REPOSITORY_URL
+ARG GIT_COMMIT_SHA
+ARG VERSION
+ENV DD_GIT_REPOSITORY_URL=${GIT_REPOSITORY_URL}
+ENV DD_GIT_COMMIT_SHA=${GIT_COMMIT_SHA}
+ENV DD_VERSION=${VERSION}
+
+EXPOSE 42069
+
+ENTRYPOINT [ "/webpush-apn-relay" ]
