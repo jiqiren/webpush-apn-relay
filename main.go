@@ -15,16 +15,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/certificate"
 	"github.com/sideshow/apns2/payload"
 	"github.com/sideshow/apns2/token"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
-
-	httptrace "github.com/DataDog/dd-trace-go/contrib/net/http/v2"
-	dd_logrus "github.com/DataDog/dd-trace-go/contrib/sirupsen/logrus/v2"
-	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
 )
 
 var (
@@ -34,6 +31,8 @@ var (
 	messageChan       chan *Message
 	maxQueueSize      int
 	maxWorkers        int
+	metricsPort       int
+	metricsBind       string
 )
 
 var envVersion = os.Getenv("DD_VERSION")
@@ -49,21 +48,27 @@ func userAgent() string {
 }
 
 func main() {
-	err := tracer.Start()
-	if err != nil {
-		log.Fatal(fmt.Sprintf("Error starting tracer: %s", err))
-		return
-	}
+	httpClient := http.DefaultClient
 
-	httpClient := httptrace.WrapClient(http.DefaultClient)
-
-	mux := httptrace.NewServeMux()
-
-	log.AddHook(&dd_logrus.DDContextLogHook{})
+	mux := http.NewServeMux()
 
 	flag.IntVar(&maxQueueSize, "max-queue-size", 4096, "Maximum number of messages to queue")
 	flag.IntVar(&maxWorkers, "max-workers", 8, "Maximum number of workers")
+	flag.IntVar(&metricsPort, "metrics-port", 0, "Port to serve Prometheus /metrics on (0 disables)")
+	flag.StringVar(&metricsBind, "metrics-bind-address", "127.0.0.1", "Address to bind the metrics listener to (use 0.0.0.0 to allow remote scrapes)")
 	flag.Parse()
+
+	// METRICS_PORT is honoured only when the flag was left at its default, so
+	// an explicit command-line flag always wins over the container environment.
+	if metricsPort == 0 {
+		if raw := env("METRICS_PORT", ""); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				metricsPort = parsed
+			} else {
+				log.Warn(fmt.Sprintf("Ignoring invalid METRICS_PORT %q: %s", raw, err))
+			}
+		}
+	}
 
 	topic = env("TOPIC", "cx.c3.toot")
 	p12file := env("P12_FILENAME", "toot-relay.p12")
@@ -133,22 +138,39 @@ func main() {
 		productionClient.HTTPClient.Transport.(*http2.Transport).TLSClientConfig.RootCAs = rootCAs
 	}
 
-	// instrument the HTTP clients with Datadog APM
-	httptrace.WrapClient(developmentClient.HTTPClient)
-	httptrace.WrapClient(productionClient.HTTPClient)
-
 	mux.HandleFunc("POST /relay-to/{environment}/{token}/{extra...}", handleApnNotification)
 	mux.HandleFunc("GET /relay-to/_health", handleHealthCheck)
 
 	messageChan = make(chan *Message, maxQueueSize)
+	queueCapacity.Set(float64(maxQueueSize))
 	for i := 1; i <= maxWorkers; i++ {
 		go apnNotificationsWorker(i, httpClient)
+	}
+
+	// Metrics are served on a separate listener so the public relay port does
+	// not expose internal telemetry by default. Loopback binding by default
+	// means a sidecar or host process scrapes it without opening the network.
+	if metricsPort != 0 {
+		go serveMetrics(metricsBind, metricsPort)
 	}
 
 	if _, err := os.Stat(tlsCrtFile); !os.IsNotExist(err) {
 		log.Fatal(http.ListenAndServeTLS(":"+port, tlsCrtFile, tlsKeyFile, mux))
 	} else {
 		log.Fatal(http.ListenAndServe(":"+port, mux))
+	}
+}
+
+// serveMetrics exposes the Prometheus registry. A failure here is logged but
+// never fatal: telemetry must not be able to take the relay down.
+func serveMetrics(bind string, port int) {
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{}))
+
+	addr := bind + ":" + strconv.Itoa(port)
+	log.Info(fmt.Sprintf("serving Prometheus metrics on http://%s/metrics", addr))
+	if err := http.ListenAndServe(addr, metricsMux); err != nil {
+		log.Error(fmt.Sprintf("metrics server stopped: %s", err))
 	}
 }
 
@@ -168,9 +190,6 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 		requestID = uuid.New().String()
 	}
 
-	span, _ := tracer.SpanFromContext(ctx)
-	span.SetTag("request-id", requestID)
-
 	requestLog := log.WithFields(log.Fields{"request-id": requestID}).WithContext(ctx)
 
 	isProduction := request.PathValue("environment") == "production"
@@ -181,6 +200,7 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 	buffer := new(bytes.Buffer)
 	_, err := buffer.ReadFrom(request.Body)
 	if err != nil {
+		recordRelayRequest("error_body")
 		http.Error(writer, "Error reading request body", http.StatusInternalServerError)
 		requestLog.Error(fmt.Sprintf("Error reading request body: %s", err))
 		return
@@ -202,6 +222,7 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 		if publicKey, err := encodedValue(request.Header, "Crypto-Key", "dh"); err == nil {
 			payload.Custom("k", publicKey)
 		} else {
+			recordRelayRequest("error_crypto_key")
 			writer.WriteHeader(500)
 			fmt.Println(writer, "Error retrieving public key:", err)
 			requestLog.Error(fmt.Sprintf("Error retrieving public key: %s", err))
@@ -211,6 +232,7 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 		if salt, err := encodedValue(request.Header, "Encryption", "salt"); err == nil {
 			payload.Custom("s", salt)
 		} else {
+			recordRelayRequest("error_salt")
 			writer.WriteHeader(500)
 			fmt.Println(writer, "Error retrieving salt:", err)
 			requestLog.Error(fmt.Sprintf("Error retrieving salt: %s", err))
@@ -218,6 +240,7 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 		}
 	case "aes128gcm": // RFC8030+RFC8291+RFC8292 support. No further headers needed.
 	default:
+		recordRelayRequest("error_encoding")
 		writer.WriteHeader(415)
 		fmt.Println(writer, "Unsupported Content-Encoding:", request.Header.Get("Content-Encoding"))
 		requestLog.Error(fmt.Sprintf("Unsupported Content-Encoding: %s", request.Header.Get("Content-Encoding")))
@@ -244,6 +267,8 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 	unsubscribeUrl := request.Header.Get("Unsubscribe-Url")
 
 	messageChan <- &Message{isProduction, notification, unsubscribeUrl, requestLog, context.WithoutCancel(ctx)}
+
+	recordRelayRequest("accepted")
 
 	// always reply w/ success, since we don't know how apple responded
 	writer.WriteHeader(201)

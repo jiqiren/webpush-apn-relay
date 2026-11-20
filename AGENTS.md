@@ -10,7 +10,7 @@ accepts RFC 8030 web push POSTs and forwards the encrypted payloads to iOS via
 APNs. Origin: Mastodon's relay for the Toot! client. Module path is
 `github.com/mastodon/webpush-apn-relay`.
 
-~450 lines across two files. No database, no frontend, no code generation, no
+~650 lines across three files. No database, no frontend, no code generation, no
 test files, no linter config.
 
 ## Layout
@@ -19,6 +19,8 @@ test files, no linter config.
 |---|---|
 | `main.go` | Entry point, config, HTTP routes, z85 encoder, header parsing |
 | `process_apn_notification.go` | Worker pool, APNs push, 410 unsubscribe handling |
+| `metrics.go` | Prometheus registry, metric definitions, `/metrics` helper wiring |
+| `observability/` | Prometheus + Grafana stack, generated dashboard, alert rules. Not part of the Go build. |
 | `Dockerfile` | Multi-stage in-container build. **Used by CI.** |
 | `Dockerfile.cross` | Runtime-only image; binary is built on the host |
 | `build.sh` | Cross-compiles then invokes `Dockerfile.cross` |
@@ -100,10 +102,15 @@ level=fatal msg="Error loading certificate file: open toot-relay.p12: no such fi
 
 Other things that look like failures but are not:
 
-- **Datadog tracer warnings are benign.** `Unable to reach agent intake: ...
-  localhost:8126 ... connection refused` is normal without a DogStatsD agent; the
-  tracer continues. Note `tracer.Start()` failure *is* fatal, so do not conclude
-  the tracer is optional.
+- **Metrics are off by default.** `/metrics` exists only when started with
+  `-metrics-port` (or `METRICS_PORT`). It is a separate listener bound to
+  `127.0.0.1` by default, so the public relay port returns 404 for it — that is
+  intentional isolation, not a broken route. A metrics bind failure is logged,
+  never fatal. See `observability/README.md`.
+- **`DD_VERSION` is not dead despite the tracer being gone.** It feeds
+  `userAgent()`, which is set on the unsubscribe `DELETE`. Renaming or removing
+  it changes what the origin server sees. `DD_GIT_REPOSITORY_URL` and
+  `DD_GIT_COMMIT_SHA`, still set by both Dockerfiles, *are* unread by any code.
 - **Timestamps inside the container are UTC.** Distroless has no `tzdata`.
 - **`CA_FILENAME` is unset locally but `/cas.crt` in the image.** Locally
   `os.ReadFile("")` errors and the error is correctly ignored, falling back to
@@ -112,7 +119,7 @@ Other things that look like failures but are not:
 ## Conventions and shape of the code
 
 - Routes use Go 1.22+ method-and-wildcard patterns and depend on
-  `httptrace.NewServeMux()` returning a `*ServeMux` that supports
+  `http.NewServeMux()` returning a `*ServeMux` that supports
   `PathValue("extra...")` catch-all segments:
   `POST /relay-to/{environment}/{token}/{extra...}`, `GET /relay-to/_health`.
 - Requests are **not** sent to APNs inline. They are pushed onto the package-level

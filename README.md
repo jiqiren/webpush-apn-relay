@@ -75,8 +75,27 @@ committed). Without one, startup ends with:
 level=fatal msg="Error loading certificate file: open toot-relay.p12: no such file or directory"
 ```
 
-A Datadog agent is not required. If `localhost:8126` is unreachable the tracer
-logs a warning and continues.
+### Metrics
+
+The service exports [Prometheus](https://prometheus.io/) metrics, but only if
+you ask for them — the listener is off by default:
+
+```
+./webpush-apn-relay -metrics-port 19100
+```
+
+`METRICS_PORT=19100` is equivalent; the flag wins if both are set. Metrics are
+served from a separate listener on `127.0.0.1` (override with
+`-metrics-bind-address`) so the public port never exposes them. A metrics
+listener that cannot bind is logged and does not stop the relay.
+
+See [`observability/`](observability/) for metric definitions, a Prometheus +
+Grafana stack, a dashboard, and suggested alert rules.
+
+`DD_VERSION` is unrelated to metrics and is still read: it becomes the
+`User-Agent` sent on unsubscribe `DELETE` requests. The `DD_GIT_*` variables the
+Dockerfiles set are leftovers from the previous Datadog tracer and are no longer
+read by anything.
 
 A simple Dockerfile is included for running the service containerised. It has been
 tested with the following hosting solutions:

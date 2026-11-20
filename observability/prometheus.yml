@@ -1,0 +1,30 @@
+# Standalone Prometheus configuration for webpush-apn-relay.
+#
+# The relay only serves /metrics when started with -metrics-port (or
+# METRICS_PORT); it is disabled by default, and the listener binds to
+# 127.0.0.1 unless -metrics-bind-address says otherwise.
+#
+# This is a COMPLETE prometheus.yml: mount it directly at
+#   /etc/prometheus/prometheus.yml
+# as observability/docker-compose.yml does. To fold the job into an existing
+# Prometheus instead, copy only the scrape_configs entry below.
+#
+# Target choice:
+#   - Prometheus on the SAME host as the relay, running as a process or with
+#     host networking: keep 127.0.0.1:19100.
+#   - Prometheus in a container on rootless podman (default bridge network):
+#     127.0.0.1 is the container's own loopback, NOT the host. Either run the
+#     relay with -metrics-bind-address 0.0.0.0 and use the host's LAN address,
+#     or use host.containers.internal (podman) / host.docker.internal (docker)
+#     and keep loopback binding on the relay side only if Prometheus also runs
+#     on the host. See observability/README.md.
+
+global:
+  scrape_interval: 15s
+  external_labels:
+    service: webpush-apn-relay
+
+scrape_configs:
+  - job_name: webpush-apn-relay
+    static_configs:
+      - targets: ["127.0.0.1:19100"]

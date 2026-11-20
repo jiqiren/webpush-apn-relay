@@ -1,0 +1,54 @@
+# Local observability stack for webpush-apn-relay: Prometheus + Grafana.
+#
+# Written for podman-compose / docker-compose on the Raspberry Pi host.
+#
+# IMPORTANT (rootless podman): the relay's metrics listener binds to loopback
+# by default, which a container cannot reach. Either
+#   a) run the relay with -metrics-bind-address 0.0.0.0 and scrape it over the
+#      container network, or
+#   b) leave it on loopback and scrape from the host, using host.containers.internal
+#      (podman) / host.docker.internal (docker) as the target.
+# The scrape file in this directory uses (b). Adjust targets to match your choice.
+#
+# Usage:
+#   podman-compose -f observability/docker-compose.yml up -d
+#   Grafana: http://localhost:3000  (admin / admin, forced change on first login)
+#   Prometheus: http://localhost:9090
+
+services:
+  prometheus:
+    image: docker.io/prom/prometheus:latest
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      # prometheus.yml in this directory is a complete, ready-to-mount config.
+      # Edit its targets to match your topology before starting (see README).
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 90 days is cheap for a service emitting ~20 series.
+      - --storage.tsdb.retention.time=90d
+
+  grafana:
+    image: docker.io/grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Set these in an .env file next to this compose file; do not commit real values.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # Provisioning means the datasource and dashboard appear on first start,
+      # so the stack is usable without clicking through the UI.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+volumes:
+  prometheus-data:
+  grafana-data:

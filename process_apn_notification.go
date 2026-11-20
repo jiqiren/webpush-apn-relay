@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
-	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
 	"github.com/sideshow/apns2"
 	log "github.com/sirupsen/logrus"
 )
@@ -14,7 +14,7 @@ type Message struct {
 	isProduction   bool
 	notification   *apns2.Notification
 	unsubscribeUrl string
-	requestLog     *log.Entry // For logging with datadog context
+	requestLog     *log.Entry // Carries the request-id field into the worker goroutine
 	ctx            context.Context
 }
 
@@ -28,12 +28,15 @@ func apnNotificationsWorker(workerId int, httpClient *http.Client) {
 }
 
 func processApnNotificationMessage(msg *Message, httpClient *http.Client, workerId int) {
-	span, sctx := tracer.StartSpanFromContext(msg.ctx,
-		"processMessage",
-		tracer.Tag("workerId", workerId),
-		tracer.Tag("deviceToken", msg.notification.DeviceToken),
-	)
-	defer span.Finish()
+	workersActive.Inc()
+	defer workersActive.Dec()
+
+	environment := environmentName(msg.isProduction)
+
+	// The timer starts at worker pickup, not at request arrival, so it measures
+	// the APNs round-trip and excludes queue wait. Queue wait is observable
+	// separately via relay_queue_depth.
+	start := time.Now()
 
 	var client *apns2.Client
 	if msg.isProduction {
@@ -42,21 +45,26 @@ func processApnNotificationMessage(msg *Message, httpClient *http.Client, worker
 		client = developmentClient
 	}
 
-	res, err := client.PushWithContext(sctx, msg.notification)
+	res, err := client.PushWithContext(msg.ctx, msg.notification)
+	pushDurationSeconds.WithLabelValues(environment).Observe(time.Since(start).Seconds())
 
 	if err != nil {
+		recordPush(msg.isProduction, "error")
 		msg.requestLog.Error(fmt.Sprintf("Push error: %s", err))
 		return
 	}
 
+	recordApnsStatus(msg.isProduction, res.StatusCode)
+
 	if !res.Sent() {
+		recordPush(msg.isProduction, "rejected")
 		unsubscribed := false
 
 		// 410 status means that the token is invalid. This is a definitive error, and we should remove the subscription
 		// from the originating server to avoid continuing sending requests that will never work again.
 		// See https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns
 		if msg.unsubscribeUrl != "" && res.StatusCode == 410 {
-			unsubscribed = unsubscribe(msg.unsubscribeUrl, httpClient, sctx, msg.requestLog)
+			unsubscribed = unsubscribe(msg.unsubscribeUrl, httpClient, msg.ctx, msg.requestLog)
 		}
 
 		msg.requestLog.WithFields(log.Fields{
@@ -66,11 +74,10 @@ func processApnNotificationMessage(msg *Message, httpClient *http.Client, worker
 			"unsubscribed": unsubscribed,
 		}).Error(fmt.Sprintf("Failed to send notification (%v)", res.StatusCode))
 
-		span.SetTag("unsubscribed", unsubscribed)
-		span.SetTag("apns.errorCode", res.StatusCode)
-
 		return
 	}
+
+	recordPush(msg.isProduction, "sent")
 
 	msg.requestLog.WithFields(log.Fields{
 		"status-code":  res.StatusCode,
@@ -84,15 +91,10 @@ func processApnNotificationMessage(msg *Message, httpClient *http.Client, worker
 }
 
 func unsubscribe(unsubscribeUrl string, httpClient *http.Client, ctx context.Context, requestLog *log.Entry) bool {
-	span, sctx := tracer.StartSpanFromContext(ctx, "unsubscribe",
-		tracer.Tag("unsubscribeUrl", unsubscribeUrl),
-	)
-	defer span.Finish()
-
-	unsubscribeReq, reqErr := http.NewRequestWithContext(sctx, "DELETE", unsubscribeUrl, nil)
-	unsubscribeReq.Header.Set("User-Agent", userAgent())
+	unsubscribeReq, reqErr := http.NewRequestWithContext(ctx, "DELETE", unsubscribeUrl, nil)
 
 	if reqErr != nil {
+		recordUnsubscribe("build_request_error")
 		requestLog.WithFields(log.Fields{
 			"error":           reqErr.Error(),
 			"unsubscribe-url": unsubscribeUrl,
@@ -100,8 +102,11 @@ func unsubscribe(unsubscribeUrl string, httpClient *http.Client, ctx context.Con
 		return false
 	}
 
+	unsubscribeReq.Header.Set("User-Agent", userAgent())
+
 	unsubscribeResp, respErr := httpClient.Do(unsubscribeReq)
 	if respErr != nil {
+		recordUnsubscribe("error")
 		requestLog.WithFields(log.Fields{
 			"error":           respErr.Error(),
 			"unsubscribe-url": unsubscribeUrl,
@@ -110,8 +115,10 @@ func unsubscribe(unsubscribeUrl string, httpClient *http.Client, ctx context.Con
 	}
 
 	if unsubscribeResp.StatusCode == 200 {
+		recordUnsubscribe("ok")
 		return true
 	} else {
+		recordUnsubscribe("error")
 		requestLog.WithFields(log.Fields{
 			"status-code":     unsubscribeResp.StatusCode,
 			"unsubscribe-url": unsubscribeUrl,
