@@ -61,7 +61,7 @@ dependency and rootless mode fails with
 
 There are two image paths, and the choice matters:
 
-- **`Dockerfile`** compiles inside `golang:1.26-trixie`. Correct on native
+- **`Dockerfile`** compiles inside `golang:1.27-trixie`. Correct on native
   architecture and what `release.yml` runs. CI is unaffected by the emulation
   issue below because GitHub runners are native x86_64.
 - **`build.sh` + `Dockerfile.cross`** compiles on the host with `GOOS`/`GOARCH`
@@ -82,6 +82,45 @@ fully static binary (`ldd` reports "not a dynamic executable"), which is what
 lets it run on distroless — an image with no glibc. `build.sh` asserts both the
 architecture and `statically linked` before committing an image; keep those
 guards if you touch the script.
+
+### Keep Go on the latest stable release
+
+This project deliberately tracks the newest stable Go. Most minor releases
+include security fixes to the standard library (`net/http`, `crypto/*`,
+`net/http2`), and this service is an internet-facing HTTP server that terminates
+TLS to APNs, so those fixes are the point — not the language features. Do not
+leave the version pinned at an older release because it "works".
+
+**Three places pin the version, and all three must move together.** Bumping only
+`go.mod` is the usual mistake; it silently leaves release images on the old
+compiler:
+
+1. `go.mod` — the `go` directive. `go mod tidy` will *lower* it to the highest
+   directive any dependency declares, so the floor is whatever the dependencies
+   require (as of writing, `golang.org/x/net`, `x/crypto`, `x/sys`, `x/text` and
+   `prometheus/common` all declare `go 1.26.0`). Setting it above that floor is
+   allowed and is what we want; expect `tidy` to leave it alone.
+2. `Dockerfile` — `FROM golang:<ver>-trixie`. This is the compiler that builds
+   the published image, so it is the one that actually determines whether a
+   release contains a given stdlib fix. `release.yml` runs this file.
+3. `.github/workflows/go.yml` — `go-version-file: go.mod`, which follows item 1
+   automatically. Nothing to edit, which is why it is easy to overlook that CI
+   and `Dockerfile` can disagree.
+
+`build.sh` compiles with the host toolchain, so the local build tracks whatever
+Homebrew has at `/home/linuxbrew/.linuxbrew/bin/go`. With `GOTOOLCHAIN=auto`
+(the default) the `go` command will also download a newer toolchain on demand if
+a `go.mod` asks for one, so no host action is normally needed.
+
+When bumping, verify the image tag exists before pushing, since `release.yml`
+fails on a bad tag only at release time:
+
+```sh
+podman manifest inspect docker.io/library/golang:1.27-trixie >/dev/null && echo tag exists
+```
+
+Prefer a `-trixie` suffix over the bare major tag so the Debian base stays
+aligned with `gcr.io/distroless/base-debian13` in the runtime stage.
 
 ## Runtime gotchas
 
@@ -158,7 +197,8 @@ CI runs only `go build -v ./...` and `go test -v ./...`, so anything that fails
 ## Local environment facts
 
 Debian 13 (trixie) on aarch64 (Raspberry Pi 5). Homebrew at
-`/home/linuxbrew/.linuxbrew`. Installed: Go 1.27.3 via brew (`go.mod` declares
-1.26; builds fine), podman 5.4.2 + `uidmap` + `qemu-user-static` via apt.
+`/home/linuxbrew/.linuxbrew`. Installed: Go 1.27.4 via brew (matches the
+`golang:1.27-trixie` build image, so local and CI compile with the same
+version), podman 5.4.2 + `uidmap` + `qemu-user-static` via apt.
 Rootless podman works. `sudo` requires a password, so apt installs must be run
 by the user.

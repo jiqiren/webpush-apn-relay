@@ -26,8 +26,14 @@ a machine whose architecture differs from your deploy target.
 
 ### In-container build (`Dockerfile`)
 
-The default path, and what CI uses. Multi-stage: `golang:1.26-trixie` compiles
+The default path, and what CI uses. Multi-stage: `golang:1.27-trixie` compiles
 the service, and the result is copied into `gcr.io/distroless/base-debian13`.
+
+The Go version tracks the latest stable release, because minor releases carry
+security fixes to the standard library and this service is internet-facing and
+terminates TLS to APNs. See the *Keep Go on the latest stable release* section of
+[`AGENTS.md`](AGENTS.md) — the version is pinned in `go.mod` **and** in
+`Dockerfile`, and both have to move together.
 
 ```sh
 podman build -t webpush-apn-relay .

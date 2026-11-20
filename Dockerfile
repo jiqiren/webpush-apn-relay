@@ -1,4 +1,4 @@
-FROM golang:1.26-trixie as build-env
+FROM golang:1.27-trixie as build-env
 WORKDIR /go/src/webpush-apn-relay
 
 COPY go.mod ./
