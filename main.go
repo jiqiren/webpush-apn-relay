@@ -14,8 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/certificate"
