@@ -179,6 +179,14 @@ Other things that look like failures but are not:
   a wire format shared with the iOS client — changing it breaks decryption.
 - `aes128gcm` is accepted in the `Content-Encoding` switch but the README says
   the client cannot handle it. Confirm client support before relying on it.
+- **Never answer `4xx` for a relay-side failure.** Mastodon's
+  `Web::PushNotificationWorker` destroys the `Web::PushSubscription` on any
+  response in `400..499` except `408` and `429`, so a `4xx` from this service is
+  effectively an unsubscribe command and can mass-unsubscribe users. Relay-side
+  problems are `5xx`; `429` is reserved for a full queue (see
+  `queueMessage`), `501` for an unsupported `Content-Encoding`. The one `4xx`
+  the relay does send on a success path is `410`, and that is only in the
+  `Unsubscribe-Url` `DELETE`, never as the push response.
 
 ## Verifying changes
 

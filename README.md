@@ -122,15 +122,22 @@ It does support the various headers, such as `TTL:`, `Urgency:`, and `Topic:`,
 which are converted into expiration time, priority (`very-low` and `low` are 5,
 `high` and `very-high` are 10), and collapse ID.
 
-The returned `Location:` header is nonsensical, but contains the APNs ID. I did
-not read the spec closely enough to see if this address is actually used for
-anything, but I do not think it is needed by Mastodon.
+The relay replies `201 Created` as soon as a notification is queued, before
+Apple has been contacted. That is RFC 8030's synchronous mode: `201` means
+*accepted for delivery*, not *delivered*, and the APNs outcome is never
+reported back to the sender. Genuine delivery confirmation would require the
+asynchronous mode with `Receipt:` headers, which is not implemented here and
+which Mastodon does not request.
 
-Currently only `Content-Encoding: aesgcm` is supported. `aes128gcm` is trivial
-to support in this service, as it just needs to ignore the extra headers
-(`Encryption:` and `Crypto-Key:`) used by `aesgcm`, but my client-side code does
-not support it and this it is rejected. If your client-side code can handle it,
-uncomment the line referring to it.
+Because Mastodon treats most `4xx` responses as a permanent failure and deletes
+the user's Web Push subscription outright (every `4xx` except `408` and `429`),
+this service answers `5xx` for anything that is its own problem, and reserves
+`429` for the queue being full. A `4xx` from a relay is effectively an
+unsubscribe command.
+
+`Content-Encoding: aes128gcm` is accepted, and any other encoding is answered
+with `501 Not Implemented` rather than `415` - see the note above on why
+relays avoid `4xx`.
 
 ## Configuration
 
@@ -138,6 +145,7 @@ uncomment the line referring to it.
 
 - `-max-queue-size`: sets the size of the channel that buffers incoming notifications. Raising this value will consume more RAM (Go will pre-allocate the entire buffer to hold `N * size of message`). Defaults to `4096`.
 - `-max-workers`: sets the number of parallel goroutines that will send notifications to Apple. Raising it will drain the queue more quickly at a small cost to increased resource usage. Each goroutine uses gets approx. 2kb of memory. This can safely scale into the thousands, if needed. See [this post](https://tpaschalis.github.io/goroutines-size/) for scaling considerations. Defaults to `8`.
+- `-queue-drop-timeout`: how long an incoming notification waits for room in the queue before the relay answers `429 Too Many Requests`. A short wait absorbs ordinary bursts; `0` rejects immediately whenever the queue is full. Once the wait expires the notification is dropped rather than queued, and the `429` tells the sender to back off instead of leaving it to time out and retry. Defaults to `2s`.
 
 ### Environment Variables
 

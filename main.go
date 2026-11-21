@@ -32,6 +32,7 @@ var (
 	messageChan       chan *Message
 	maxQueueSize      int
 	maxWorkers        int
+	queueDropTimeout  time.Duration
 	metricsPort       int
 	metricsBind       string
 )
@@ -55,6 +56,7 @@ func main() {
 
 	flag.IntVar(&maxQueueSize, "max-queue-size", 4096, "Maximum number of messages to queue")
 	flag.IntVar(&maxWorkers, "max-workers", 8, "Maximum number of workers")
+	flag.DurationVar(&queueDropTimeout, "queue-drop-timeout", 2*time.Second, "How long to wait for queue space before answering 429 (0 rejects immediately when full)")
 	flag.IntVar(&metricsPort, "metrics-port", 0, "Port to serve Prometheus /metrics on (0 disables)")
 	flag.StringVar(&metricsBind, "metrics-bind-address", "127.0.0.1", "Address to bind the metrics listener to (use 0.0.0.0 to allow remote scrapes)")
 	flag.Parse()
@@ -236,9 +238,12 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 			payload.Custom("k", publicKey)
 		} else {
 			recordRelayRequest("error_crypto_key")
-			writer.WriteHeader(500)
-			fmt.Println(writer, "Error retrieving public key:", err)
 			requestLog.Error(fmt.Sprintf("Error retrieving public key: %s", err))
+			// 500, not 4xx: Mastodon destroys the subscription on any 4xx other
+			// than 408 and 429, and a parse failure here is a relay-side problem,
+			// not proof the endpoint is dead. The body deliberately omits the
+			// error text, which may quote header values.
+			http.Error(writer, "Error parsing Crypto-Key header", http.StatusInternalServerError)
 			return
 		}
 
@@ -246,17 +251,21 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 			payload.Custom("s", salt)
 		} else {
 			recordRelayRequest("error_salt")
-			writer.WriteHeader(500)
-			fmt.Println(writer, "Error retrieving salt:", err)
 			requestLog.Error(fmt.Sprintf("Error retrieving salt: %s", err))
+			// See the Crypto-Key branch above for why this is 5xx.
+			http.Error(writer, "Error parsing Encryption header", http.StatusInternalServerError)
 			return
 		}
 	case "aes128gcm": // RFC8030+RFC8291+RFC8292 support. No further headers needed.
 	default:
 		recordRelayRequest("error_encoding")
-		writer.WriteHeader(415)
-		fmt.Println(writer, "Unsupported Content-Encoding:", request.Header.Get("Content-Encoding"))
 		requestLog.Error(fmt.Sprintf("Unsupported Content-Encoding: %s", request.Header.Get("Content-Encoding")))
+		// 501 Not Implemented, deliberately not 415 Unsupported Media Type.
+		// 415 blames the request, but the limitation is ours, and Mastodon
+		// destroys the Web Push subscription on any 4xx outside {408, 429} -
+		// a capability gap on this side must not unsubscribe the user.
+		writer.Header().Set("Accept-Encoding", "aesgcm, aes128gcm")
+		http.Error(writer, "Unsupported Content-Encoding", http.StatusNotImplemented)
 		return
 	}
 
@@ -279,12 +288,51 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 
 	unsubscribeUrl := request.Header.Get("Unsubscribe-Url")
 
-	messageChan <- &Message{isProduction, notification, unsubscribeUrl, requestLog, context.WithoutCancel(ctx)}
+	// A bare channel send blocks indefinitely once the queue fills, and the
+	// sender sees only a read timeout - which it answers by retrying, turning
+	// overload into a retry storm. Reject instead, after a short wait that lets
+	// ordinary bursts wait their turn.
+	if !queueMessage(writer, isProduction, notification, unsubscribeUrl, requestLog, ctx) {
+		return
+	}
 
 	recordRelayRequest("accepted")
 
 	// always reply w/ success, since we don't know how apple responded
 	writer.WriteHeader(201)
+}
+
+// queueMessage hands a notification to the worker pool, waiting up to
+// queueDropTimeout for room. It returns false when the message was not queued,
+// having already written the response.
+func queueMessage(writer http.ResponseWriter, isProduction bool, notification *apns2.Notification, unsubscribeUrl string, requestLog *log.Entry, ctx context.Context) bool {
+	msg := &Message{isProduction, notification, unsubscribeUrl, requestLog, context.WithoutCancel(ctx)}
+
+	select {
+	case messageChan <- msg:
+		return true
+	default:
+	}
+
+	timer := time.NewTimer(queueDropTimeout)
+	defer timer.Stop()
+
+	select {
+	case messageChan <- msg:
+		return true
+	case <-timer.C:
+		recordRelayRequest("error_queue_full")
+		requestLog.Error("Message queue full; rejecting notification")
+		// 429 is one of the two 4xx codes Mastodon will not treat as permanent,
+		// and it is the accurate description: the subscription is fine, this
+		// relay is simply at capacity.
+		http.Error(writer, "Relay queue full", http.StatusTooManyRequests)
+		return false
+	case <-ctx.Done():
+		// The sender gave up. Nothing was queued and nothing was pushed.
+		recordRelayRequest("error_client_gone")
+		return false
+	}
 }
 
 func env(name, defaultValue string) string {
