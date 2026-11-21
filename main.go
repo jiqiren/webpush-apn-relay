@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
@@ -132,10 +133,22 @@ func main() {
 		productionClient = apns2.NewClient(cert).Production()
 	}
 
-	// We only want to add root CAs when we are using a client CA, and have a TLSClientConfig.
-	if rootCAs != nil && developmentClient.HTTPClient.Transport.(*http2.Transport).TLSClientConfig != nil {
-		developmentClient.HTTPClient.Transport.(*http2.Transport).TLSClientConfig.RootCAs = rootCAs
-		productionClient.HTTPClient.Transport.(*http2.Transport).TLSClientConfig.RootCAs = rootCAs
+	// We only want to add root CAs when we are using a client CA.
+	// apns2 builds the token-auth transport without a TLSClientConfig (only the
+	// certificate-auth path sets one), so it has to be created before RootCAs
+	// can be assigned. Otherwise CA_FILENAME is silently ignored when
+	// TOKEN_AUTH_KEY_FILENAME is in use.
+	if rootCAs != nil {
+		for _, c := range []*apns2.Client{developmentClient, productionClient} {
+			http2Transport, ok := c.HTTPClient.Transport.(*http2.Transport)
+			if !ok {
+				log.Fatalf("unexpected APNs transport type %T; cannot apply CA_FILENAME", c.HTTPClient.Transport)
+			}
+			if http2Transport.TLSClientConfig == nil {
+				http2Transport.TLSClientConfig = &tls.Config{}
+			}
+			http2Transport.TLSClientConfig.RootCAs = rootCAs
+		}
 	}
 
 	mux.HandleFunc("POST /relay-to/{environment}/{token}/{extra...}", handleApnNotification)
