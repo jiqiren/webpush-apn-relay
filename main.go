@@ -178,7 +178,7 @@ func handleHealthCheck(writer http.ResponseWriter, request *http.Request) {
 	requestLog := log.WithContext(request.Context())
 
 	writer.WriteHeader(200)
-	fmt.Println(writer, "OK")
+	fmt.Fprint(writer, "OK")
 	requestLog.Info("Health check OK")
 }
 
