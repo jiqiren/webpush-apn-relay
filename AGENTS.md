@@ -3,6 +3,11 @@
 Notes for automated agents working in this repository. Read this before changing
 build tooling or making assumptions about the runtime.
 
+**Do not add a `Co-Authored-By:` trailer to commits in this repository** — nor
+`Assisted-By:`, `Generated-With:`, or any other trailer attributing the work to a
+model or tool. Commit messages describe the change, not the software that typed
+it. If a commit already has one, remove the line rather than amending around it.
+
 ## What this is
 
 `webpush-apn-relay` (historically "toot-relay") is a single Go service that
@@ -48,6 +53,9 @@ go build -v ./...            # build
 go vet ./...                 # vet (clean at time of writing)
 go test ./...                # main_test.go: aes128gcm header shape checks
 ```
+
+Commit with a plain message: subject line, blank line, body. No
+`Co-Authored-By:` (see the note at the top).
 
 Images are built with **podman**, not docker. On Debian use `/usr/bin/podman`
 (5.4.2); do not install podman from Homebrew, its build has no Linux `uidmap`
