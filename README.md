@@ -206,6 +206,15 @@ decrypt the payloads once they arrive. The original payload is transmitted in th
 the cryptographic salt in `s`, and any extra value supplied in the push endpoint
 URL (the `extra` part as shown in the Usage section above) is passed in `x`.
 
+Which of `k` and `s` appear depends on the content encoding the application
+server chose, and the relay does not change it. With `aesgcm` both are present
+and `p` holds the ciphertext alone. With `aes128gcm` — RFC 8291, what Mastodon
+and GoToSocial send today — neither is present, because RFC 8188 puts the salt
+and the server key in a 86-octet header at the front of the body, so `p` carries
+them. A client that wants to work with both decides which path to take by
+whether `s` and `k` are there, and `iOS/DecryptNotification.swift` does exactly
+that.
+
 ### Example
 
 An [excerpt of the Toot! code base](iOS/) for receiving and decrypting messages

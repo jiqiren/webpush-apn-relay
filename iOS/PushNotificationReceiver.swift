@@ -151,4 +151,13 @@ enum PushNotificationReceiverErrorType: Error {
 	case creatingRandomDataFailed(Error?)
 	case keyExhangedFailed(Error?)
 	case clearTextTooShort
+
+	// aes128gcm (see Aes128Gcm.swift). Kept in this enum rather than a separate
+	// one so a single catch handles both content codings.
+	case payloadTooShort(Int)
+	case invalidKeyLength(Int)
+	case invalidServerKey
+	case invalidRecord
+	case authenticationFailed
+	case invalidPaddingDelimiter(UInt8)
 }

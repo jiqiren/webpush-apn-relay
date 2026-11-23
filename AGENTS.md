@@ -179,14 +179,23 @@ Other things that look like failures but are not:
   them inherits the existing data race surface; `go test` has no coverage to
   catch regressions.
 - `encode85` implements z85 **extended** to arbitrary lengths (see README). It is
-  a wire format shared with the iOS client — changing it breaks decryption.
+  a wire format shared with the iOS client — changing it breaks decryption. The
+  digit table is z85's own:
+  `0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#`.
+  It is *not* the table in RFC 8292's example or in libzmq, which orders digits
+  and letters differently; `iOS/Decode85.swift` must stay byte-identical to this
+  table or every decode is garbage that surfaces only as an AEAD tag failure.
 - `aes128gcm` (RFC 8291, the encoding senders use today) is accepted and its
   86-octet content-coding header is shape-checked by `checkAes128gcmHeader`.
   Nothing is copied out of the request headers for it — the salt and server key
   are in the body, so `p` carries the body whole. The check catches truncation
-  only: the relay holds no key and cannot validate the crypto. The vendored
-  Toot! Swift under `iOS/` still implements the `aesgcm` KDF only, so a client
-  needs its own `aes128gcm` path (see `iOS/PushNotificationReceiver.swift`).
+  only: the relay holds no key and cannot validate the crypto.
+- `iOS/Aes128Gcm.swift` is the client side of that encoding and is the one piece
+  of `iOS/` that is *not* vendored Toot! code. It derives keys with CryptoKit
+  rather than Security/CommonCrypto because RFC 8291 §3.4 interleaves two HKDFs
+  — the Expand of the first feeds the Extract of the second — which neither
+  `CryptoKit.hkdfDerivedSymmetricKey` nor the fused `deriveKey` helper used by
+  the `aesgcm` path can express. Each step is a plain HMAC-SHA-256 instead.
 - **Never answer `4xx` for a relay-side failure.** Mastodon's
   `Web::PushNotificationWorker` destroys the `Web::PushSubscription` on any
   response in `400..499` except `408` and `429`, so a `4xx` from this service is
@@ -211,6 +220,32 @@ file ./webpush-apn-relay
 
 CI runs only `go build -v ./...` and `go test -v ./...`, so anything that fails
 `go build` breaks the release pipeline.
+
+### Type-checking the vendored Swift
+
+Nothing compiles `iOS/`, so a syntax error there is invisible to CI. On a macOS
+host the whole directory type-checks in a few seconds:
+
+```sh
+swiftc -typecheck -sdk "$(xcrun --show-sdk-path --sdk macosx)" \
+  -import-objc-header iOS/BridgingHeader.h iOS/*.swift
+```
+
+The `-import-objc-header` is required, not optional: `PushNotificationReceiver`
+uses `CCHmac*`, and `import CommonCrypto` from Swift does not work on macOS —
+the framework has no Swift-visible module map, so the app's bridging header is
+the only way in. This checks that the code compiles; it does not run it. To
+actually decrypt something, see the harness note below.
+
+### Running the client decryption against a real message
+
+`iOS/` has no test target, and the aes128gcm path cannot be verified by
+inspection — every key-schedule and padding mistake presents as either an AEAD
+tag failure or corrupt JSON, with nothing pointing at the cause. A scratch SwiftPM
+package that mirrors `iOS/` plus a Go fixture generator is the fastest way to
+get a real answer; it is scaffolding, kept out of the repo, and is not something
+CI can run (CI is Linux, CryptoKit is Apple-only). It produces a GoToSocial-shaped
+message, sends it through the relay's own `encode85`, and decrypts it client-side.
 
 ## Releasing: images are built by GitHub Actions, not on a workstation
 

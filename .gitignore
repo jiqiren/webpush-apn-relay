@@ -2,3 +2,7 @@ webpush-apn-relay
 *.p12
 *.crt
 *.key
+
+# Created by swiftc when the vendored iOS code is type-checked on a workstation;
+# see AGENTS.md. Never part of the Go build.
+.build/

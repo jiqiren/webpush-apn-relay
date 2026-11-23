@@ -16,29 +16,54 @@ private let DecodeTable: [UInt32] = [
 ]
 
 extension String {
+	/// Decodes z85 extended to arbitrary lengths, the format `encode85` in the
+	/// relay's main.go produces.
+	///
+	/// Unlike the base64 case, a trailing partial group is not a multiple of
+	/// five characters: n bytes are encoded as n + 1 characters, so a body
+	/// whose length is not a multiple of four ends in two, three or four
+	/// characters. `n` is therefore the size of the pending group and must be
+	/// reset when a group is emitted. It was not, which left the counter at
+	/// four for every body of length 4k+1, 4k+2 or 4k+3 - one quarter of all
+	/// payloads, since a push body's length is essentially arbitrary - and the
+	/// tail was then decoded as though four characters had been pending. The
+	/// first 4k octets came out right, so the AEAD tag was what reported it,
+	/// as an authentication failure with nothing to point at the decoder.
 	func decode85() -> Data {
 		var data = Data()
 		var block: UInt32 = 0
-		var n = 0
+		var pending = 0
+
 		for c in utf8 {
-			if c >= 32, c < 128, DecodeTable[Int(c - 32)] != 0xff {
-				let value = DecodeTable[Int(c - 32)]
-				block = block * 85 + value
-				n += 1
-				if n == 5 {
-					data.append(UInt8(block >> 24))
-					data.append(UInt8((block >> 16) & 0xff))
-					data.append(UInt8((block >> 8) & 0xff))
-					data.append(UInt8(block & 0xff))
-					block = 0
-					n = 0
-				}
+			guard c >= 32, c < 128, DecodeTable[Int(c - 32)] != 0xff else {
+				continue
+			}
+
+			block = block &* 85 &+ DecodeTable[Int(c - 32)]
+			pending += 1
+
+			if pending == 5 {
+				data.append(UInt8(block >> 24))
+				data.append(UInt8((block >> 16) & 0xff))
+				data.append(UInt8((block >> 8) & 0xff))
+				data.append(UInt8(block & 0xff))
+				block = 0
+				pending = 0
 			}
 		}
 
-		if n >= 4 { data.append(UInt8((block >> 16) & 0xff)) }
-		if n >= 3 { data.append(UInt8((block >> 8) & 0xff)) }
-		if n >= 2 { data.append(UInt8(block & 0xff)) }
+		// A partial group holds fewer than four octets, so the accumulated value
+		// is under 2^32 by construction: encode85 emits n + 1 characters for n
+		// octets, and the largest four-character group is 85^4 - 1, which is
+		// what a full group needs. The overflowing arithmetic the old code could
+		// hit - a sixth character accumulating onto a full group's value, which
+		// is a trap in a debug build - was a symptom of the same lost reset.
+		switch pending {
+		case 2: data.append(UInt8(block & 0xff))
+		case 3: data.append(UInt8((block >> 8) & 0xff)); data.append(UInt8(block & 0xff))
+		case 4: data.append(UInt8((block >> 16) & 0xff)); data.append(UInt8((block >> 8) & 0xff)); data.append(UInt8(block & 0xff))
+		default: break
+		}
 
 		return data
 	}
