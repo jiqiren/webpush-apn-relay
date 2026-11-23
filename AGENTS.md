@@ -162,6 +162,15 @@ Other things that look like failures but are not:
   it changes what the origin server sees. `DD_GIT_REPOSITORY_URL` and
   `DD_GIT_COMMIT_SHA`, still set by both Dockerfiles, *are* unread by any code.
 - **Timestamps inside the container are UTC.** Distroless has no `tzdata`.
+- **`TOPIC` defaults to `cx.c3.toot`, Toot!'s bundle identifier, and both
+  Dockerfiles leave it unset** — so a container runs with the wrong topic for any
+  other app. The topic is what selects the receiving app, so a mismatch makes
+  Apple reject every push with `BadTopic`. It is invisible from the outside: the
+  relay answers `201` before contacting Apple, so the sender sees success and no
+  notification arrives. This is the "image builds, service runs, nothing gets
+  delivered" case. `main.go:99` is the default, `main.go:294` the only place it
+  is used; the incoming `Topic:` header does not affect it (that becomes the
+  collapse ID).
 - **`CA_FILENAME` is unset locally but `/cas.crt` in the image.** Locally
   `os.ReadFile("")` errors and the error is correctly ignored, falling back to
   system roots. Not a bug.

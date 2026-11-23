@@ -137,7 +137,9 @@ POST requests, and not async requests with receipts.
 
 It does support the various headers, such as `TTL:`, `Urgency:`, and `Topic:`,
 which are converted into expiration time, priority (`very-low` and `low` are 5,
-`high` and `very-high` are 10), and collapse ID.
+`high` and `very-high` are 10), and collapse ID. The `Topic:` header is the
+sender's collapse ID, not the APNs topic that selects the receiving app; that one
+is server-side configuration, see `TOPIC` below.
 
 The relay replies `201 Created` as soon as a notification is queued, before
 Apple has been contacted. That is RFC 8030's synchronous mode: `201` means
@@ -192,6 +194,15 @@ For authentication to Apple, the relay will use the first defined variable from 
   environment variables for secret values.
 * `P12_PASSWORD`: The password for the p12 file or base64 encoded data. Defaults to no
   password.
+* `TOPIC`: The APNs topic, which is the bundle identifier of the iOS app that
+  should receive the push. It is set on every notification the relay sends, and
+  defaults to `cx.c3.toot` - Toot!'s bundle identifier - so **any other app has
+  to set this**. If it does not match the app the device token belongs to, Apple
+  rejects the push with `BadTopic`; because the relay replies `201` before
+  contacting Apple, the sender still sees success and nothing arrives, so a wrong
+  value looks like a silently broken relay rather than a misconfiguration. It is
+  unrelated to the incoming `Topic:` header, which the relay maps to APNs'
+  collapse ID - senders cannot set this.
 * `PORT`: The port to listen on. Defaults to `42069`.
 * `CRT_FILENAME`: The crt file to use for TLS connections. Defaults to `toot-relay.crt`.
 * `KEY_FILENAME`: The key file to use for TLS connections. Defaults to `toot-relay.key`.
