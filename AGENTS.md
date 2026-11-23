@@ -29,7 +29,7 @@ code generation, no linter config.
 | `Dockerfile` | Multi-stage in-container build. **Used by CI.** |
 | `Dockerfile.cross` | Runtime-only image; binary is built on the host |
 | `build.sh` | Cross-compiles then invokes `Dockerfile.cross`. **Local images only** — see "Releasing" |
-| `cas.crt` | Bundled CA, baked into the image as `CA_FILENAME` |
+| `cas.crt` | Pinned root CA for APNs TLS (USERTrust RSA); baked into the image as `CA_FILENAME`. See Runtime gotchas |
 | `iOS/*.swift` | Vendored Toot! client — the reference for the wire format. **Not compiled by anything here.** |
 | `now.json` | Legacy Zeit Now config. Ignore unless asked about it. |
 | `.github/workflows/` | `go.yml` (build+test), `release.yml` (publish to ghcr.io) |
@@ -165,6 +165,17 @@ Other things that look like failures but are not:
 - **`CA_FILENAME` is unset locally but `/cas.crt` in the image.** Locally
   `os.ReadFile("")` errors and the error is correctly ignored, falling back to
   system roots. Not a bug.
+- **`cas.crt` is pinned to exactly one root: USERTrust RSA Certification
+  Authority**, added in `15cbd8f` (2021) when Apple's APNs chain terminated in
+  AddTrust/USERTrust. It still works — Apple currently serves a two-cert chain
+  (`api.push.apple.com` <- `Apple Public Server RSA CA 11 - G1` <- USERTrust RSA)
+  — but it is *pinning*, not supplementing: `x509.NewCertPool()` starts empty and
+  `AppendCertsFromPEM` adds only what is in the file, so the system store is not
+  consulted. If Apple moves APNs to a root with no USERTrust cross-signature,
+  every push fails with a certificate error and only a rebuild fixes it. The file
+  is not a secret and is not a private CA; it is a snapshot of one public root.
+  `1024670` (2026-11-20) is what made it take effect on the token-auth path —
+  before that `CA_FILENAME` was silently ignored unless using a `.p12`.
 
 ## Conventions and shape of the code
 

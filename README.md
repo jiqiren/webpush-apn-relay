@@ -197,6 +197,10 @@ For authentication to Apple, the relay will use the first defined variable from 
 * `KEY_FILENAME`: The key file to use for TLS connections. Defaults to `toot-relay.key`.
 * `CA_FILENAME`: A file containing PEM encoded certificates that will override the system
   root CAs when connecting to the Apple Notification Service API if set. Default: unset.
+  "Override" is literal: the listed certificates become the *only* trust anchors,
+  so an incomplete file breaks every APNs connection rather than falling back.
+  The published images set this to `/cas.crt`, a copy of the single USERTrust RSA
+  root that Apple's chain currently chains to — see the Dockerfiles.
 
 ## Receiving
 
