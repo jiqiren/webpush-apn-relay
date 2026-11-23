@@ -15,14 +15,15 @@ accepts RFC 8030 web push POSTs and forwards the encrypted payloads to iOS via
 APNs. Origin: Mastodon's relay for the Toot! client. Module path is
 `github.com/mastodon/webpush-apn-relay`.
 
-~800 lines across three files, plus `main_test.go`. No database, no frontend, no
-code generation, no linter config.
+~1,700 lines across five files, plus `main_test.go`, `register_test.go` and
+`status_test.go`. No database, no frontend, no code generation, no linter config.
 
 ## Layout
 
 | Path | Notes |
 |---|---|
-| `main.go` | Entry point, config, HTTP routes, z85 encoder, header parsing |
+| `main.go` | Entry point, config, HTTP routes, z85 encoder, header parsing, `/status` |
+| `register.go` | `POST /register` / `POST /unregister` and their input validation |
 | `process_apn_notification.go` | Worker pool, APNs push, 410 unsubscribe handling |
 | `metrics.go` | Prometheus registry, metric definitions, `/metrics` helper wiring |
 | `observability/` | Prometheus + Grafana stack, generated dashboard, alert rules. Not part of the Go build. |
@@ -51,7 +52,7 @@ export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
 ```sh
 go build -v ./...            # build
 go vet ./...                 # vet (clean at time of writing)
-go test ./...                # main_test.go: aes128gcm header shape checks
+go test ./...                # main_test.go, register_test.go, status_test.go
 ```
 
 Commit with a plain message: subject line, blank line, body. No
@@ -133,6 +134,40 @@ podman manifest inspect docker.io/library/golang:1.27-trixie >/dev/null && echo 
 Prefer a `-trixie` suffix over the bare major tag so the Debian base stays
 aligned with `gcr.io/distroless/base-debian13` in the runtime stage.
 
+## Registration endpoints
+
+`POST /register` and `POST /unregister` exist for clients that cannot compose the
+relay URL themselves. Three decisions there are load-bearing and easy to "fix" in
+the wrong direction:
+
+- **No database, on purpose.** The endpoint URL is self-contained, so `/register`
+  is a pure function of its inputs and `/unregister` logs and returns `200`. A
+  restart loses nothing. Do not add SQLite or Postgres without an explicit
+  decision: it changes the deployment story of a service whose whole value is
+  being one static binary behind a reverse proxy. `register_test.go`
+  (`TestStatelessnessIsStructural`) fails if `register.go` grows a second
+  package-level variable or if the push path references a device registry, so an
+  accidental drift toward state is a build failure, not a review catch. An
+  in-memory `sync.Map` of device tokens was added and then removed for exactly
+  this reason: unbounded memory, empty after every restart, answering a question
+  nobody had asked.
+- **Unauthenticated, on purpose.** Anyone can mint an endpoint for a device token
+  they already know, which gets them nothing: payloads are encrypted to the
+  client's own VAPID key, which the caller does not have, and the relay stores
+  nothing. Do not add auth the client has no code to send.
+- **`relayKey` is returned but verifies nothing.** The iOS client decodes it as a
+  required `String`, so a `200` without it reads as a failure on the client and a
+  success in the relay log. It returns `RELAY_KEY` or `""`. Turning it into a
+  real gate requires a client-side change to send it on the push path — that is
+  not half-implemented here, deliberately.
+
+`/register` may answer `4xx` for a malformed body because the caller is the iOS
+client with no subscription to lose. This is the **only** place that is true; the
+relay path keeps the `5xx` rule. `serverURL` is validated but stored nowhere and
+dialed by nothing, so it is not an SSRF surface today — if that ever changes, the
+caller-controlled value must also be blocked from private, loopback and link-local
+ranges.
+
 ## Runtime gotchas
 
 The service **exits at startup without APNs credentials**. This is the single
@@ -151,6 +186,24 @@ level=fatal msg="Error loading certificate file: open toot-relay.p12: no such fi
 ```
 
 Other things that look like failures but are not:
+
+- **`GET /status` is the way to check the above without opening the container.**
+  It reports the evaluated `TOPIC`, `authMode` (`token` or `p12`), `keyFingerprint`,
+  `caFilename`, `DD_VERSION` and uptime. `authMode` is assigned where the clients are
+  built, not read from the environment.
+- **`/status` cannot diagnose a credential that failed to load, and must not be
+  described as if it could.** Every failure in `loadAPNsCredentials` is `log.Fatal`,
+  so such a process never binds a port: under `restart: always` it crash-loops with
+  no health endpoint. That is why `authMode` has two values and not three — the old
+  `"none"` was the label for the *successful* `P12_FILENAME` branch, which made it
+  read as "no credential" while meaning the opposite. The zero value is `""`.
+  The log line is the diagnostic for a bad credential.
+- **No Key ID or Team ID on `/status`.** The endpoint shares the public listener with
+  `/relay-to`, so assume anything it returns is public. A Key ID exists only in the
+  server's docker-compose — it is not in the app bundle and not in the iOS repo, so
+  publishing it names a target for no diagnostic gain. `keyFingerprint` (8 hex chars
+  of SHA-256 over the parsed public key) replaces it and is verifiable locally.
+  `status_test.go` fails if either identifier reappears.
 
 - **Metrics are off by default.** `/metrics` exists only when started with
   `-metrics-port` (or `METRICS_PORT`). It is a separate listener bound to
@@ -191,7 +244,10 @@ Other things that look like failures but are not:
 - Routes use Go 1.22+ method-and-wildcard patterns and depend on
   `http.NewServeMux()` returning a `*ServeMux` that supports
   `PathValue("extra...")` catch-all segments:
-  `POST /relay-to/{environment}/{token}/{extra...}`, `GET /relay-to/_health`.
+  `POST /relay-to/{environment}/{token}/{extra...}`, `GET /relay-to/_health`,
+  `POST /register`, `POST /unregister`, `GET /status`. `register_test.go`
+  (`TestRouteParity`) reads `main.go` and fails if a route is added that its
+  allowlist has not been argued about; add the pattern to that test deliberately.
 - Requests are **not** sent to APNs inline. They are pushed onto the package-level
   `messageChan`, and `maxWorkers` goroutines drain it. `main.go` pre-allocates
   `maxQueueSize` slots, so raising `-max-queue-size` costs real RAM.
@@ -235,11 +291,20 @@ Other things that look like failures but are not:
 
 ## Verifying changes
 
-`go test ./...` covers the aes128gcm header shape checks in `main_test.go`; there
-is no test for the HTTP handler or the APNs path, so verify those by running the
-binary and checking it reaches the expected credential error (or starts cleanly
-when credentials are supplied). To confirm a build targeted the right
-architecture:
+`go test ./...` covers the aes128gcm header shape checks (`main_test.go`), the
+registration and status endpoints end to end through `httptest`
+(`register_test.go`, `status_test.go`) including the rule that a relay fault is never
+a `4xx`, and the credential chain as a table over generated keys and certificates
+(`TestCredentialChainSelectsMode`) — the last of those only became testable once
+`loadAPNsCredentials` returned an error instead of calling `log.Fatal`, since a test
+cannot observe a branch that exits the process. There is
+still no test for the APNs send path, so verify that by running the binary and
+checking it reaches the expected credential error (or starts cleanly when
+credentials are supplied). Tests are in `package main` and build the mux by hand,
+because `main()` calls `log.Fatal` when no credentials exist; `TestRouteParity` is
+what keeps a hand-built mux from drifting from `main.go`.
+
+To confirm a build targeted the right architecture:
 
 ```sh
 podman inspect <image> --format '{{.Architecture}} {{.Os}}'

@@ -164,6 +164,147 @@ parsed at all. That check catches truncation; it cannot validate crypto the rela
 holds no key for. Any other encoding is answered with `501 Not Implemented` rather
 than `415` - see the note above on why relays avoid `4xx`.
 
+## HTTP endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/relay-to/<environment>/<device-token>[/<extra>]` | Accept an RFC 8030 push and queue it for APNs. `201` on acceptance. |
+| `GET` | `/relay-to/_health` | Liveness probe. Responds `OK`, no configuration disclosed. |
+| `POST` | `/register` | Mint a relay endpoint for a client that cannot compose the URL itself. |
+| `POST` | `/unregister` | Acknowledge a sign-out. A no-op that logs. |
+| `GET` | `/status` | The server-side configuration that is otherwise invisible. |
+
+### `POST /register`
+
+For clients that cannot build the endpoint URL on their own. Request body, with
+**camelCase** keys:
+
+```json
+{
+  "deviceToken": "<hex APNs device token>",
+  "vapidPublicKey": "<base64url uncompressed P-256 key>",
+  "serverURL": "https://mastodon.social",
+  "environment": "production"
+}
+```
+
+Response, `200` with `Content-Type: application/json`:
+
+```json
+{
+  "endpoint": "https://relay.example/relay-to/production/<token>/",
+  "relayKey": ""
+}
+```
+
+The returned `endpoint` always carries a trailing slash. That is not cosmetic:
+the push route's `{extra...}` pattern cannot match a two-segment path, so a
+slash-less endpoint answers `307`, and a redirected `POST` risks losing
+`Content-Encoding`, `Crypto-Key`, `Encryption`, `TTL`, `Urgency` and
+`Unsubscribe-Url`.
+
+`relayKey` is always present and never null, because the iOS client decodes it as
+a required `String` - omitting it makes the client's JSON decoder throw *after* a
+`200`. Its value is the `RELAY_KEY` environment variable, or `""` when unset —
+present but empty, never a placeholder word: `relayKey` must exist as a field, and a
+sentinel like `"none"` is indistinguishable from a real value in a client log.
+It is not a credential: nothing verifies it and no client sends it. Making it gate
+anything is a client-side change as well, and is not implemented.
+
+`environment` is optional and whitelisted to `development` or `production`;
+anything else, including an absent field, becomes `production`. That direction is
+deliberate - APNs environment comes from the `aps-environment` entitlement baked
+into the installed build, and every TestFlight and App Store build is production,
+so defaulting to development would silently break real users while working in the
+simulator.
+
+`/register` answers `4xx` for a malformed request, which is safe here and nowhere
+else: the caller is the iOS client, which has no Web Push subscription to lose.
+The relay path keeps its `5xx`-for-our-faults rule.
+
+**This endpoint is unauthenticated, and that is intentional.** Anyone can mint a
+valid relay endpoint for a device token they already know. It gets them nothing:
+payloads are end-to-end encrypted to the client's own VAPID key, which the caller
+does not have, and the relay stores nothing. Do not "fix" this by adding auth the
+client has no code to send.
+
+### `POST /unregister`
+
+`{"device_token": "<hex token>"}` - **snake_case here**, camelCase above; the
+asymmetry is inherited from the client and the server matches it. Any `2xx` is
+fine and the body is ignored. An unknown token still succeeds: this is called on
+sign-out and must not surface an error to a user who has already left.
+
+Both endpoints are stateless, structurally rather than by convention: `register.go`
+declares exactly one package-level variable (`relayKeyValue`, read once from the
+environment) and no store of any kind. The endpoint URL is self-contained, so a
+lost registration costs nothing and the service stays one restartable binary. An
+earlier draft kept a `sync.Map` of known tokens for a `/status` device count; it was
+removed, because it was memory that no caller had asked for and a restart "cleared"
+it anyway. `TestStatelessnessIsStructural` fails if package-level state reappears in
+`register.go` or if the push path ever references a device registry.
+
+`serverURL` is logged - the only signal of which instances use the relay - and is
+stored nowhere and fetched by nothing. If a future change ever dials it, it must
+also block private, loopback and link-local addresses, because an unauthenticated
+caller controls that string.
+
+### `GET /status`
+
+Reports the configuration that cannot be inferred from outside:
+
+```json
+{
+  "topic": "ninja.dusty.seloi.Seloi",
+  "authMode": "token",
+  "keyFingerprint": "49e07388",
+  "caFilename": "/cas.crt",
+  "version": "v0.9.2",
+  "uptimeSeconds": 1234
+}
+```
+
+It exists because a wrong `TOPIC` makes Apple reject every push with `BadTopic`
+while the relay still answers `201` - the failure is invisible from the sender's
+side, and until this endpoint existed the only way to check it was to inspect the
+container.
+
+`authMode` is `token` or `p12`, assigned where the APNs clients are built rather
+than read from the environment. Those are the only two values, because every other
+path in the credential chain is **fatal at startup**.
+
+That limit is worth stating plainly, because it is easy to over-read this endpoint.
+A credential that fails to load does not appear here as some kind of error state -
+there is no such process. A bad `.p8`, undecodable `P12_BASE64`, or a missing
+`.p12` makes the relay exit before it binds a port, so under `restart: always` you
+get a crash loop with no health endpoint and no `/status` to query. The log line is
+the diagnostic for that case:
+
+```
+level=fatal msg="loading token auth key /etc/authkey.p8: token: AuthKey must be a valid .p8 PEM file"
+```
+
+So `/status` proves the process came up with working credentials and tells you
+which mode it chose. It does not diagnose a credential that failed to load.
+
+No key material is served, and the handler cannot reach any: the p8 contents, p12
+bytes and `P12_PASSWORD` are locals inside `loadAPNsCredentials`. The response
+deliberately carries **no Key ID and no Team ID**. This endpoint sits on the same
+public listener as `/relay-to`, so everything in it should be assumed to end up in a
+public paste, and a Key ID names the exact key to attack while adding nothing a
+`keyFingerprint` does not. `keyFingerprint` is the first 8 hex characters of the
+SHA-256 over the parsed public half of the loaded credential - the leaf certificate's
+DER under p12, the `0x04||X||P` point under token auth - so it is reproducible from
+the key file itself and cannot report the name of a key the process never loaded:
+
+```sh
+openssl pkcs12 -in cert.p12 -nokeys -passin pass: | openssl x509 -outform der \
+  | openssl dgst -sha256 | cut -c10-17
+```
+
+`version` is `DD_VERSION`, empty for an unstamped build. The response is
+`Cache-Control: no-store`.
+
 ## Configuration
 
 ### Runtime Flags
@@ -212,6 +353,11 @@ For authentication to Apple, the relay will use the first defined variable from 
   so an incomplete file breaks every APNs connection rather than falling back.
   The published images set this to `/cas.crt`, a copy of the single USERTrust RSA
   root that Apple's chain currently chains to — see the Dockerfiles.
+* `RELAY_KEY`: Returned as `relayKey` by `POST /register`, which the iOS client
+  decodes as a required string. Defaults to the empty string. Not a credential
+  and verified by nothing — see `POST /register`.
+* `DD_VERSION`: The version reported by `GET /status` and sent in the `User-Agent`
+  of the unsubscribe `DELETE`. Both Dockerfiles set it to the release tag.
 
 ## Receiving
 

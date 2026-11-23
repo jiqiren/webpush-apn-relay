@@ -34,6 +34,8 @@ cannot be enumerated in advance — use `... or vector(0)` when you need a zero.
 | `relay_push_duration_seconds` | histogram | `environment` | Worker pickup to APNs response. **Excludes queue wait.** |
 | `relay_apns_response_status_total` | counter | `environment`, `status` | Every HTTP status Apple returned, including 200. |
 | `relay_unsubscribes_total` | counter | `result` | `DELETE` calls to `Unsubscribe-Url`, fired on APNs 410. `ok`, `error`, `build_request_error`. |
+| `relay_registrations_total` | counter | `outcome` | `POST /register` and `POST /unregister` by result: `register_ok`, `register_bad_request`, `register_body_too_large`, `unregister_ok`. |
+| `relay_status_requests_total` | counter | `outcome` | `GET /status` served. `ok`. A rising line means someone is reading the relay's configuration from outside, which is intended but worth noticing. |
 | `relay_queue_depth` | gauge | — | Messages waiting for a worker. |
 | `relay_queue_capacity` | gauge | — | `-max-queue-size`. |
 | `relay_workers_active` | gauge | — | Workers currently blocked on an APNs round-trip. |

@@ -7,6 +7,7 @@ require (
 	github.com/sideshow/apns2 v0.25.0
 	github.com/sirupsen/logrus v1.9.4
 	golang.org/x/net v0.59.0
+	software.sslmate.com/src/go-pkcs12 v0.7.4
 )
 
 require (
