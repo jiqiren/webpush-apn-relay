@@ -219,7 +219,10 @@ file ./webpush-apn-relay
 ```
 
 CI runs only `go build -v ./...` and `go test -v ./...`, so anything that fails
-`go build` breaks the release pipeline.
+`go build` breaks the release pipeline. Note that `go.yml` triggers on `push:
+branches: [master]` while the default branch is **main**, so it does not run on
+ordinary pushes — the three release runs on record are all `release.yml`. The Go
+code is therefore verified locally, not by CI, unless that trigger is fixed.
 
 ### Type-checking the vendored Swift
 
