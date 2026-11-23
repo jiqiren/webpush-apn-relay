@@ -56,6 +56,31 @@ var (
 		[]string{"result"},
 	)
 
+	// registrationsTotal counts /register and /unregister separately from
+	// relay_relay_requests_total, because their outcomes are not comparable: a
+	// "bad request" on the registration path is a client bug that costs a user
+	// their notifications, while on the push path it is a payload problem. Merging
+	// them would make either one unreadable.
+	registrationsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "relay_registrations_total",
+			Help: "Registration requests received, by outcome.",
+		},
+		[]string{"outcome"},
+	)
+
+	// statusRequestsTotal counts GET /status. It is a counter rather than a gauge
+	// because the value it protects against is surprise traffic to an endpoint that
+	// discloses configuration: a rising line is the signal, and a gauge would only
+	// show the last scrape.
+	statusRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "relay_status_requests_total",
+			Help: "GET /status requests served, by outcome.",
+		},
+		[]string{"outcome"},
+	)
+
 	// queueDepth samples the shared message channel. Defined here but
 	// registered by main once messageChan exists, since the closure reads it.
 	queueDepth = prometheus.NewGaugeFunc(
@@ -95,6 +120,8 @@ func init() {
 	metricsRegistry.MustRegister(pushDurationSeconds)
 	metricsRegistry.MustRegister(apnsResponseStatusTotal)
 	metricsRegistry.MustRegister(unsubscribesTotal)
+	metricsRegistry.MustRegister(registrationsTotal)
+	metricsRegistry.MustRegister(statusRequestsTotal)
 	metricsRegistry.MustRegister(queueDepth)
 	metricsRegistry.MustRegister(queueCapacity)
 	metricsRegistry.MustRegister(workersActive)
@@ -134,6 +161,16 @@ func initializeLabelSeries() {
 	for _, result := range []string{"ok", "error", "build_request_error"} {
 		unsubscribesTotal.WithLabelValues(result).Add(0)
 	}
+
+	for _, outcome := range []string{
+		"register_ok", "register_bad_request", "register_body_too_large", "unregister_ok",
+	} {
+		registrationsTotal.WithLabelValues(outcome).Add(0)
+	}
+
+	for _, outcome := range []string{"ok"} {
+		statusRequestsTotal.WithLabelValues(outcome).Add(0)
+	}
 }
 
 // recordRelayRequest counts an inbound request by outcome. Kept as a function
@@ -159,4 +196,12 @@ func recordApnsStatus(isProduction bool, statusCode int) {
 
 func recordUnsubscribe(result string) {
 	unsubscribesTotal.WithLabelValues(result).Inc()
+}
+
+func recordRegistration(outcome string) {
+	registrationsTotal.WithLabelValues(outcome).Inc()
+}
+
+func recordStatusRequest(outcome string) {
+	statusRequestsTotal.WithLabelValues(outcome).Inc()
 }

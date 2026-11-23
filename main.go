@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,9 +20,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sideshow/apns2"
-	"github.com/sideshow/apns2/certificate"
 	"github.com/sideshow/apns2/payload"
-	"github.com/sideshow/apns2/token"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 )
@@ -37,6 +36,23 @@ var (
 	maxBodySize       int64
 	metricsPort       int
 	metricsBind       string
+
+	// apnsAuthMode records which branch of the credential chain actually built the
+	// clients. It has exactly two values, "token" and "p12": every other path in
+	// loadAPNsCredentials is fatal, so a process that is running always has one.
+	// The zero value is "" on purpose - see loadAPNsCredentials.
+	apnsAuthMode string
+
+	// apnsKeyFingerprint is a short hash of the public half of whichever credential
+	// loaded, for "is this the key I think it is?". See apnsCredentials.
+	apnsKeyFingerprint string
+
+	// caFilenameResolved is the CA_FILENAME value in effect, for /status. It is
+	// the evaluated string, not whether it loaded: an unset CA_FILENAME yields ""
+	// locally and "/cas.crt" in the image, and the difference is worth seeing.
+	caFilenameResolved string
+
+	startedAt = time.Now()
 )
 
 // maxBodySize bounds the request body this relay will accept, set by
@@ -112,6 +128,7 @@ func main() {
 	// used as the sole root CAs when connecting to the Apple Notification Service API.
 	// If unset, the system-wide certificate store will be used.
 	caFile := env("CA_FILENAME", "")
+	caFilenameResolved = caFile
 	var rootCAs *x509.CertPool
 
 	if caPEM, err := os.ReadFile(caFile); err == nil {
@@ -121,42 +138,26 @@ func main() {
 		}
 	}
 
-	if tokenSignKeyFile != "" {
-		authKey, err := token.AuthKeyFromFile(tokenSignKeyFile)
-		if err != nil {
-			log.Fatal(fmt.Sprintf("Error loading token auth key %s: %s", tokenSignKeyFile, err))
-		}
-
-		token := &token.Token{
-			AuthKey: authKey,
-			KeyID:   tokenKeyId,
-			TeamID:  tokenTeamId,
-		}
-
-		developmentClient = apns2.NewTokenClient(token).Development()
-		productionClient = apns2.NewTokenClient(token).Production()
-	} else if p12base64 != "" {
-		bytes, err := base64.StdEncoding.DecodeString(p12base64)
-		if err != nil {
-			log.Fatal(fmt.Sprintf("Base64 decoding error: %s", err))
-		}
-
-		cert, err := certificate.FromP12Bytes(bytes, p12password)
-		if err != nil {
-			log.Fatal(fmt.Sprintf("Error parsing certificate: %s", err))
-		}
-
-		developmentClient = apns2.NewClient(cert).Development()
-		productionClient = apns2.NewClient(cert).Production()
-	} else {
-		cert, err := certificate.FromP12File(p12file, p12password)
-		if err != nil {
-			log.Fatal(fmt.Sprintf("Error loading certificate file: %s", err))
-		}
-
-		developmentClient = apns2.NewClient(cert).Development()
-		productionClient = apns2.NewClient(cert).Production()
+	// The credential chain always ends in a load attempt: p12file has a default, so
+	// there is no configuration in which the relay starts without trying one.
+	credentials, err := loadAPNsCredentials(apnsCredentialConfig{
+		tokenKeyFile: tokenSignKeyFile,
+		tokenKeyID:   tokenKeyId,
+		tokenTeamID:  tokenTeamId,
+		p12File:      p12file,
+		p12Base64:    p12base64,
+		p12Password:  p12password,
+	})
+	if err != nil {
+		// Fatal, and it always was: there is no running process that failed to load a
+		// credential, so the log line is the diagnostic for that case, not /status.
+		log.Fatal(err)
 	}
+
+	developmentClient = credentials.development
+	productionClient = credentials.production
+	apnsAuthMode = credentials.mode
+	apnsKeyFingerprint = credentials.keyFingerprint
 
 	// We only want to add root CAs when we are using a client CA.
 	// apns2 builds the token-auth transport without a TLSClientConfig (only the
@@ -178,6 +179,18 @@ func main() {
 
 	mux.HandleFunc("POST /relay-to/{environment}/{token}/{extra...}", handleApnNotification)
 	mux.HandleFunc("GET /relay-to/_health", handleHealthCheck)
+
+	// Registration endpoints for clients that cannot compose a relay URL. They sit
+	// on the public port because the phone talks to it directly; the push route
+	// above is a catch-all so these must be registered as their own patterns, and
+	// Go's mux prefers a literal segment over a wildcard anyway.
+	mux.HandleFunc("POST /register", handleRegister)
+	mux.HandleFunc("POST /unregister", handleUnregister)
+
+	// Operational introspection, on the public port so it is reachable through the
+	// reverse proxy without an SSH session. /status is a literal segment and the
+	// push route lives entirely under /relay-to/, so the two trees cannot collide.
+	mux.HandleFunc("GET /status", handleStatus)
 
 	messageChan = make(chan *Message, maxQueueSize)
 	queueCapacity.Set(float64(maxQueueSize))
@@ -218,6 +231,58 @@ func handleHealthCheck(writer http.ResponseWriter, request *http.Request) {
 	writer.WriteHeader(200)
 	fmt.Fprint(writer, "OK")
 	requestLog.Info("Health check OK")
+}
+
+// handleStatus reports the configuration that cannot be inferred from outside and
+// whose failure is otherwise invisible.
+//
+// The reason it exists: a wrong TOPIC makes Apple reject every push with BadTopic
+// while the relay still answers 201 to the sender, because the response is written
+// before the push is attempted. Nothing about the running configuration - topic,
+// which credential mode won, which build this is - was observable without
+// inspecting the container.
+//
+// What it does NOT do is diagnose a credential that failed to load. Every failure in
+// loadAPNsCredentials is fatal, so such a process never serves this endpoint: it
+// exits, and under a restart policy it crash-loops with no health check to query.
+// The log line is the diagnostic for that case. /status can only report that a live
+// process came up with working credentials and say which mode it is using.
+//
+// Nothing here is secret. The response carries no Key ID and no Team ID: this
+// endpoint sits on the same public listener as the relay, so everything in it must
+// be assumed to be in a public paste, and a Key ID names the exact key to attack
+// without helping anyone debug. keyFingerprint is a short hash of the public half of
+// the loaded credential, which is reproducible by whoever holds the key and useless
+// to anyone who does not. The private material - p8 contents, p12 bytes, password -
+// is unreachable from this handler: it is local to loadAPNsCredentials and main().
+func handleStatus(writer http.ResponseWriter, request *http.Request) {
+	status := struct {
+		Topic          string `json:"topic"`
+		AuthMode       string `json:"authMode"`
+		KeyFingerprint string `json:"keyFingerprint"`
+		CAFilename     string `json:"caFilename"`
+		Version        string `json:"version"`
+		UptimeSeconds  int64  `json:"uptimeSeconds"`
+	}{
+		Topic:          topic,
+		AuthMode:       apnsAuthMode,
+		KeyFingerprint: apnsKeyFingerprint,
+		CAFilename:     caFilenameResolved,
+		Version:        envVersion,
+		UptimeSeconds:  int64(time.Since(startedAt).Seconds()),
+	}
+
+	// no-store because this is a live view of a running process, and a proxy cache
+	// holding a stale authMode is exactly the confusion this endpoint exists to end.
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.WriteHeader(http.StatusOK)
+
+	if err := json.NewEncoder(writer).Encode(status); err != nil {
+		log.WithError(err).Error("failed to write status response")
+	}
+
+	recordStatusRequest("ok")
 }
 
 func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
