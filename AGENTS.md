@@ -10,8 +10,8 @@ accepts RFC 8030 web push POSTs and forwards the encrypted payloads to iOS via
 APNs. Origin: Mastodon's relay for the Toot! client. Module path is
 `github.com/mastodon/webpush-apn-relay`.
 
-~650 lines across three files. No database, no frontend, no code generation, no
-test files, no linter config.
+~800 lines across three files, plus `main_test.go`. No database, no frontend, no
+code generation, no linter config.
 
 ## Layout
 
@@ -23,14 +23,17 @@ test files, no linter config.
 | `observability/` | Prometheus + Grafana stack, generated dashboard, alert rules. Not part of the Go build. |
 | `Dockerfile` | Multi-stage in-container build. **Used by CI.** |
 | `Dockerfile.cross` | Runtime-only image; binary is built on the host |
-| `build.sh` | Cross-compiles then invokes `Dockerfile.cross` |
+| `build.sh` | Cross-compiles then invokes `Dockerfile.cross`. **Local images only** — see "Releasing" |
 | `cas.crt` | Bundled CA, baked into the image as `CA_FILENAME` |
-| `iOS/*.swift` | Vendored client reference code. **Not compiled by anything here.** |
+| `iOS/*.swift` | Vendored Toot! client — the reference for the wire format. **Not compiled by anything here.** |
 | `now.json` | Legacy Zeit Now config. Ignore unless asked about it. |
 | `.github/workflows/` | `go.yml` (build+test), `release.yml` (publish to ghcr.io) |
 
 `iOS/` is excluded from language stats via `.gitattributes` and is not part of
-any build. Do not try to compile it.
+any build. Do not try to compile it as part of `go build`. It is the vendored
+Toot! client, kept as the reference for the wire format the relay must match, and
+it is type-checkable with the `swiftc` on a macOS host — see "Local environment
+facts".
 
 ## Commands
 
@@ -43,7 +46,7 @@ export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
 ```sh
 go build -v ./...            # build
 go vet ./...                 # vet (clean at time of writing)
-go test ./...                # "no test files" is the expected result
+go test ./...                # main_test.go: aes128gcm header shape checks
 ```
 
 Images are built with **podman**, not docker. On Debian use `/usr/bin/podman`
@@ -177,8 +180,13 @@ Other things that look like failures but are not:
   catch regressions.
 - `encode85` implements z85 **extended** to arbitrary lengths (see README). It is
   a wire format shared with the iOS client — changing it breaks decryption.
-- `aes128gcm` is accepted in the `Content-Encoding` switch but the README says
-  the client cannot handle it. Confirm client support before relying on it.
+- `aes128gcm` (RFC 8291, the encoding senders use today) is accepted and its
+  86-octet content-coding header is shape-checked by `checkAes128gcmHeader`.
+  Nothing is copied out of the request headers for it — the salt and server key
+  are in the body, so `p` carries the body whole. The check catches truncation
+  only: the relay holds no key and cannot validate the crypto. The vendored
+  Toot! Swift under `iOS/` still implements the `aesgcm` KDF only, so a client
+  needs its own `aes128gcm` path (see `iOS/PushNotificationReceiver.swift`).
 - **Never answer `4xx` for a relay-side failure.** Mastodon's
   `Web::PushNotificationWorker` destroys the `Web::PushSubscription` on any
   response in `400..499` except `408` and `429`, so a `4xx` from this service is
@@ -190,9 +198,11 @@ Other things that look like failures but are not:
 
 ## Verifying changes
 
-There are no tests, so verify by running the binary or image and checking it
-reaches the expected credential error (or starts cleanly when credentials are
-supplied). To confirm a build targeted the right architecture:
+`go test ./...` covers the aes128gcm header shape checks in `main_test.go`; there
+is no test for the HTTP handler or the APNs path, so verify those by running the
+binary and checking it reaches the expected credential error (or starts cleanly
+when credentials are supplied). To confirm a build targeted the right
+architecture:
 
 ```sh
 podman inspect <image> --format '{{.Architecture}} {{.Os}}'
@@ -202,11 +212,56 @@ file ./webpush-apn-relay
 CI runs only `go build -v ./...` and `go test -v ./...`, so anything that fails
 `go build` breaks the release pipeline.
 
+## Releasing: images are built by GitHub Actions, not on a workstation
+
+**Published images come from `.github/workflows/release.yml`, which is triggered
+by publishing a GitHub Release — not by a tag push and not by a local build.**
+Nothing needs to be built by hand to ship, and a container engine is not
+required on the machine you develop on. The steps are:
+
+```sh
+git tag v0.9.2 && git push origin v0.9.2
+gh release create v0.9.2 --generate-notes   # or draft it in the web UI
+gh run list --workflow=release.yml           # watch the build
+gh release view v0.9.2                       # image is ghcr.io/<owner>/<repo>:v0.9.2
+```
+
+Details that matter when doing this:
+
+- `release.yml` fires on `release: types: [published]`. **Pushing the tag alone
+  builds nothing.** The workflow reads `${{ github.ref_name }}` into the image
+  tag and `VERSION` build arg, so it runs against the release's tag, not your
+  working copy.
+- `go.yml` runs `go build` + `go test` on push and on PRs, so the release build
+  is not the first thing to compile your change unless you push the tag without
+  CI having gone green.
+- `docker/metadata-action` also produces `:latest` and the bare semver tags, so
+  a published release moves `ghcr.io/<owner>/<repo>:latest`. Releasing a
+  half-finished change is not harmless.
+- `build.sh` is for **local/development images only**. It derives its tag from
+  `git describe --tags --always`, so an untagged tree produces
+  `webpush-apn-relay:v0.9.1-3-gabcdef-linux-arm64`, and it never pushes. Use it
+  when the build host and deploy target differ in architecture; use a GitHub
+  Release to actually ship.
+- `release.yml` fails late and unhelpfully on a bad base image tag, which is why
+  the `podman manifest inspect` check under "Keep Go on the latest stable
+  release" is worth running before publishing.
+
 ## Local environment facts
 
-Debian 13 (trixie) on aarch64 (Raspberry Pi 5). Homebrew at
-`/home/linuxbrew/.linuxbrew`. Installed: Go 1.27.4 via brew (matches the
+Two different hosts have been used for this repo, and they differ in ways that
+matter for the above.
+
+**Build/deploy host** — Debian 13 (trixie) on aarch64 (Raspberry Pi 5). Homebrew
+at `/home/linuxbrew/.linuxbrew`. Installed: Go 1.27.4 via brew (matches the
 `golang:1.27-trixie` build image, so local and CI compile with the same
-version), podman 5.4.2 + `uidmap` + `qemu-user-static` via apt.
-Rootless podman works. `sudo` requires a password, so apt installs must be run
-by the user.
+version), podman 5.4.2 + `uidmap` + `qemu-user-static` via apt. Rootless podman
+works. `sudo` requires a password, so apt installs must be run by the user.
+
+**macOS workstation (Apple Silicon)** — Go 1.27 via Homebrew at `/opt/homebrew/bin`,
+which is *not* on a non-interactive `PATH`; prefix commands with
+`export PATH="/opt/homebrew/bin:$PATH"`. Xcode and `swiftc` are present, so the
+`iOS/` sources can at least be type-checked here. There is **no podman, docker,
+or colima**, and the Homebrew podman formula is a client-only bottle with no
+Linux `uidmap` — container builds belong in Actions on this host, not locally.
+

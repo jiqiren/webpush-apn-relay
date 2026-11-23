@@ -778,7 +778,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "accepted vs the validation failures: error_body, error_crypto_key, error_salt, error_encoding. A rising error_encoding means a client started sending an unsupported Content-Encoding.",
+      "description": "accepted vs the validation failures: error_body, error_crypto_key, error_salt, error_encoding, error_push_header, error_payload_too_large. A rising error_encoding means a client started sending an unsupported Content-Encoding; error_payload_too_large means the origin server is sending bodies APNs cannot carry.",
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",

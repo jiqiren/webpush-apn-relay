@@ -29,7 +29,7 @@ cannot be enumerated in advance — use `... or vector(0)` when you need a zero.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `relay_relay_requests_total` | counter | `outcome` | Inbound requests by validation result: `accepted`, `error_body`, `error_crypto_key`, `error_salt`, `error_encoding`. |
+| `relay_relay_requests_total` | counter | `outcome` | Inbound requests by validation result: `accepted`, `error_body`, `error_crypto_key`, `error_salt`, `error_encoding`, `error_push_header`, `error_payload_too_large`, `error_queue_full`, `error_client_gone`. |
 | `relay_pushes_total` | counter | `environment`, `result` | Pushes handed to APNs. `result` is `sent` (2xx), `rejected` (non-2xx), `error` (no HTTP response at all). |
 | `relay_push_duration_seconds` | histogram | `environment` | Worker pickup to APNs response. **Excludes queue wait.** |
 | `relay_apns_response_status_total` | counter | `environment`, `status` | Every HTTP status Apple returned, including 200. |

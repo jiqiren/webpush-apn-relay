@@ -21,8 +21,21 @@ only development will work.
 
 ## Docker
 
-There are two ways to build an image. Use the second one if you are building on
-a machine whose architecture differs from your deploy target.
+**Published images are built by GitHub Actions.** Publishing a GitHub Release
+triggers `.github/workflows/release.yml`, which builds `Dockerfile` on a native
+x86_64 runner and pushes `ghcr.io/<owner>/<repo>:<tag>` (and `:latest`). To ship
+a version, tag it and publish a release — no local image build is involved, and
+no container engine is needed on your machine:
+
+```sh
+git tag v0.9.2 && git push origin v0.9.2
+gh release create v0.9.2 --generate-notes
+```
+
+The two paths below are for building images yourself, which you only need to do
+to test a change before releasing it, or to run a fork that never gets a release.
+Use the second one if you are building on a machine whose architecture differs
+from your deploy target.
 
 ### In-container build (`Dockerfile`)
 
@@ -60,6 +73,10 @@ asserts that the compiled binary matches the requested architecture and is
 statically linked, which catches a stale binary before it is baked into an image.
 
 This is much faster than an emulated build, because the Go compiler runs natively.
+
+`build.sh` never pushes anything, and its tag comes from `git describe`, so a
+local image is development-only: it will not appear on ghcr.io and publishing a
+release does not pick it up.
 
 **Caveat when cross-building with `Dockerfile`:** running the amd64 Go compiler
 under QEMU on an arm64 host is unreliable. `go mod download` fails
@@ -135,9 +152,15 @@ this service answers `5xx` for anything that is its own problem, and reserves
 `429` for the queue being full. A `4xx` from a relay is effectively an
 unsubscribe command.
 
-`Content-Encoding: aes128gcm` is accepted, and any other encoding is answered
-with `501 Not Implemented` rather than `415` - see the note above on why
-relays avoid `4xx`.
+`Content-Encoding: aes128gcm` is the encoding web push senders use today (RFC 8291,
+which restricts RFC 8188). Unlike the older `aesgcm`, it needs no headers relayed to
+the client: the cryptographic salt and the server's public key travel in an 86-octet
+header at the front of the body, which is why `p` carries the body whole. The relay
+checks that header's shape - length, key length, uncompressed point marker, and a
+record large enough to hold a tag - and answers `500` for a body that cannot be
+parsed at all. That check catches truncation; it cannot validate crypto the relay
+holds no key for. Any other encoding is answered with `501 Not Implemented` rather
+than `415` - see the note above on why relays avoid `4xx`.
 
 ## Configuration
 
@@ -146,6 +169,7 @@ relays avoid `4xx`.
 - `-max-queue-size`: sets the size of the channel that buffers incoming notifications. Raising this value will consume more RAM (Go will pre-allocate the entire buffer to hold `N * size of message`). Defaults to `4096`.
 - `-max-workers`: sets the number of parallel goroutines that will send notifications to Apple. Raising it will drain the queue more quickly at a small cost to increased resource usage. Each goroutine uses gets approx. 2kb of memory. This can safely scale into the thousands, if needed. See [this post](https://tpaschalis.github.io/goroutines-size/) for scaling considerations. Defaults to `8`.
 - `-queue-drop-timeout`: how long an incoming notification waits for room in the queue before the relay answers `429 Too Many Requests`. A short wait absorbs ordinary bursts; `0` rejects immediately whenever the queue is full. Once the wait expires the notification is dropped rather than queued, and the `429` tells the sender to back off instead of leaving it to time out and retry. Defaults to `2s`.
+- `-max-body-size`: reject request bodies larger than this many octets. APNs allows 4 KiB for an alert, so the default of `4096` refuses payloads Apple could never have accepted instead of answering `201` and letting a worker discover it later. `0` accepts any size and leaves APNs to answer `413`. An oversized body is answered `500`, not `413` - see the note on `4xx` above.
 
 ### Environment Variables
 

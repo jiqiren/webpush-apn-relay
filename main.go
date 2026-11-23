@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -33,9 +34,30 @@ var (
 	maxQueueSize      int
 	maxWorkers        int
 	queueDropTimeout  time.Duration
+	maxBodySize       int64
 	metricsPort       int
 	metricsBind       string
 )
+
+// maxBodySize bounds the request body this relay will accept, set by
+// -max-body-size.
+//
+// APNs allows 4 KiB for an alert, and RFC 8030 section 7.2 requires a push
+// service to accept at least 4096 octets - the same figure. Without a cap, an
+// oversized payload is accepted with 201, queued, and only then rejected by
+// Apple with 413 PayloadTooLarge, after a worker has paid for a round trip to
+// discover what was knowable on arrival. The sender has already been told the
+// notification was accepted, so there is no way to report that back.
+//
+// The default is generous rather than tight. GoToSocial - the sender Seloi
+// receives from - sets recordSize to 2048 in internal/webpush/sender.go with
+// APNs' 4 kB limit explicitly in mind, so 4096 leaves real traffic untouched
+// and only rejects payloads Apple could never have taken.
+//
+// 4096 is a minimum in RFC 8030, not a maximum, so this is a limit of ours and
+// not a protocol rule: set -max-body-size to 0 to accept any size and let APNs
+// answer 413 as before.
+const defaultMaxBodySize = 4096
 
 var envVersion = os.Getenv("DD_VERSION")
 
@@ -57,6 +79,7 @@ func main() {
 	flag.IntVar(&maxQueueSize, "max-queue-size", 4096, "Maximum number of messages to queue")
 	flag.IntVar(&maxWorkers, "max-workers", 8, "Maximum number of workers")
 	flag.DurationVar(&queueDropTimeout, "queue-drop-timeout", 2*time.Second, "How long to wait for queue space before answering 429 (0 rejects immediately when full)")
+	flag.Int64Var(&maxBodySize, "max-body-size", defaultMaxBodySize, "Reject bodies larger than this many octets (0 accepts any size and lets APNs answer 413)")
 	flag.IntVar(&metricsPort, "metrics-port", 0, "Port to serve Prometheus /metrics on (0 disables)")
 	flag.StringVar(&metricsBind, "metrics-bind-address", "127.0.0.1", "Address to bind the metrics listener to (use 0.0.0.0 to allow remote scrapes)")
 	flag.Parse()
@@ -212,10 +235,48 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 	notification := &apns2.Notification{}
 	notification.DeviceToken = request.PathValue("token")
 
+	// Cap the body before reading it. MaxBytesReader leaves the excess unread
+	// rather than truncating, so the read below fails instead of quietly
+	// forwarding half a payload whose AEAD tag could never verify - a truncated
+	// record is undecryptable, and the client would have no way to say so.
+	//
+	// Passing writer is what makes the limit stick: it marks the connection
+	// non-reusable so net/http stops reading, which keeps a sender that ignores
+	// the limit from streaming unbounded bytes at us. The trade is that the
+	// connection is then closed rather than kept alive, so an oversized body
+	// costs the sender a reconnect - which is the correct cost to impose.
+	if maxBodySize > 0 {
+		request.Body = http.MaxBytesReader(writer, request.Body, maxBodySize)
+	}
+
 	buffer := new(bytes.Buffer)
 	_, err := buffer.ReadFrom(request.Body)
 	if err != nil {
+		// A body over the cap is the common case here, and it is worth its own
+		// outcome: an operator watching error_body climb needs to know whether
+		// the relay is broken or whether the origin server started sending
+		// payloads APNs cannot carry.
+		if maxBytes, oversized := asTooLarge(err); oversized {
+			recordRelayRequest("error_payload_too_large")
+			requestLog.Error(fmt.Sprintf("Request body exceeds the %d octet limit (-max-body-size)", maxBytes))
+			// 500, not 413. Mastodon destroys the subscription on any 4xx outside
+			// {408, 429}, so this is expensive to get wrong, and the limit is
+			// genuinely ours: RFC 8030 section 7.2 only requires a push service to
+			// accept 4096 octets, so a sender going larger violates nothing we can
+			// hold it to. Answering 413 would blame the sender for our APNs
+			// constraint and could mass-unsubscribe.
+			//
+			// 429 is the other code Mastodon tolerates, and is arguable - but it
+			// invites retries of a payload that is permanently too large. 500 is
+			// left deliberately: it describes a relay that cannot carry this
+			// without implying the sender should try again.
+			http.Error(writer, "Request body too large", http.StatusInternalServerError)
+			return
+		}
+
 		recordRelayRequest("error_body")
+		// The message never quotes the body, which is encrypted; MaxBytesReader's
+		// error text carries only a byte count.
 		http.Error(writer, "Error reading request body", http.StatusInternalServerError)
 		requestLog.Error(fmt.Sprintf("Error reading request body: %s", err))
 		return
@@ -257,6 +318,25 @@ func handleApnNotification(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 	case "aes128gcm": // RFC8030+RFC8291+RFC8292 support. No further headers needed.
+		//
+		// Nothing is copied out of the request headers, because RFC 8291 moved
+		// the salt and the server public key into the body itself: they are the
+		// first 82 octets of the content-coding header, followed by the keyid
+		// length. That is why `p` stays the whole body, header included, and why
+		// the client reads them from there rather than from `s` and `k`.
+		//
+		// The body is not opaque to us even so. That header is the only place
+		// those two values travel, so if it will not parse, no client can derive
+		// a key either, and the notification cannot reach the user. Catching it
+		// here costs a few length checks and turns a silent failure on the device
+		// into an error the sender can see and a counter an operator can chart.
+		if err := checkAes128gcmHeader(buffer.Bytes()); err != nil {
+			recordRelayRequest("error_push_header")
+			requestLog.Error(fmt.Sprintf("Invalid aes128gcm payload: %s", err))
+			// 500 for the reason given in the aesgcm branches below.
+			http.Error(writer, "Error parsing aes128gcm payload", http.StatusInternalServerError)
+			return
+		}
 	default:
 		recordRelayRequest("error_encoding")
 		requestLog.Error(fmt.Sprintf("Unsupported Content-Encoding: %s", request.Header.Get("Content-Encoding")))
@@ -333,6 +413,66 @@ func queueMessage(writer http.ResponseWriter, isProduction bool, notification *a
 		recordRelayRequest("error_client_gone")
 		return false
 	}
+}
+
+// aes128gcmHeaderLength is the size of the RFC 8188 content-coding header:
+//
+//	salt (16) || rs (4) || idlen (1) || keyid (idlen)
+//
+// RFC 8291 section 4 fixes idlen at 65 for web push - the application server's
+// ECDH public key in the uncompressed point form of [X9.62] - so every push
+// body opens with exactly 86 octets of header. Push messages carry a single
+// record, so there is never a second header or a record boundary to track.
+const aes128gcmHeaderLength = 86
+
+// checkAes128gcmHeader reports whether a body could be an aes128gcm payload at
+// all, by checking the shape of the content-coding header and the minimum size
+// of the record behind it.
+//
+// Be clear about what this does not do. It cannot tell good crypto from bad:
+// the relay holds no key, the client holds the private half of the ECDH pair,
+// and RFC 8291 section 3.4 needs that private key to derive anything, so a
+// payload with a well-formed header and wrong keys passes here and fails on the
+// device exactly as it always did. What it does catch is truncation and
+// non-aes128gcm bodies wearing the wrong Content-Encoding, both of which are
+// certain failures rather than probable ones - which is the only kind worth
+// rejecting on a path where a wrong answer costs users their subscription.
+//
+// rs is not examined. RFC 8291 section 4 requires exactly one record per push
+// message and lets a receiver ignore the record size, so validating it would
+// reject senders over a padding choice nobody acts on.
+func checkAes128gcmHeader(body []byte) error {
+	if len(body) < aes128gcmHeaderLength {
+		return fmt.Errorf("body is %d octets, shorter than the %d-octet aes128gcm header", len(body), aes128gcmHeaderLength)
+	}
+
+	if idLength := body[20]; idLength != 65 {
+		return fmt.Errorf("keyid is %d octets, expected 65 (an uncompressed P-256 point)", idLength)
+	}
+
+	if key := body[21]; key != 0x04 {
+		return fmt.Errorf("server public key starts with 0x%02x, expected 0x04 (uncompressed point form)", key)
+	}
+
+	// RFC 8188 section 2: a record is plaintext plus a padding delimiter plus a
+	// 16-octet tag, so 17 is the smallest a complete one can be. Anything
+	// shorter is a body that stopped arriving.
+	if record := len(body) - aes128gcmHeaderLength; record < 17 {
+		return fmt.Errorf("record is %d octets, shorter than the 17-octet minimum of one padding delimiter plus a tag", record)
+	}
+
+	return nil
+}
+
+// asTooLarge reports whether a body read failed because it exceeded the
+// -max-body-size cap, returning that cap. errors.As is used rather than a type
+// assertion because io.Reader.ReadFrom wraps what the underlying reader returns.
+func asTooLarge(err error) (int64, bool) {
+	var maxBytes *http.MaxBytesError
+	if errors.As(err, &maxBytes) {
+		return maxBytes.Limit, true
+	}
+	return 0, false
 }
 
 func env(name, defaultValue string) string {

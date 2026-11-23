@@ -155,8 +155,10 @@ panels = [
        [("sum by (outcome) (rate(relay_relay_requests_total[$__rate_interval]))",
          "{{outcome}}")], "reqps",
        "accepted vs the validation failures: error_body, error_crypto_key, "
-       "error_salt, error_encoding. A rising error_encoding means a client started "
-       "sending an unsupported Content-Encoding.", stack=True, fill=30),
+       "error_salt, error_encoding, error_push_header, error_payload_too_large. "
+       "A rising error_encoding means a client started sending an unsupported "
+       "Content-Encoding; error_payload_too_large means the origin server is "
+       "sending bodies APNs cannot carry.", stack=True, fill=30),
     ts(11, "Unsubscribe DELETEs", 0, 24, 12, 8,
        [(UNSUB, "{{result}}")], "reqps",
        "Fired on APNs 410. If ok stays at 0 while rejected rate is high, the relay "

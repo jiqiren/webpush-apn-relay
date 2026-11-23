@@ -116,7 +116,8 @@ func init() {
 func initializeLabelSeries() {
 	for _, outcome := range []string{
 		"accepted", "error_body", "error_crypto_key", "error_salt", "error_encoding",
-		"error_queue_full", "error_client_gone",
+		"error_push_header", "error_queue_full", "error_client_gone",
+		"error_payload_too_large",
 	} {
 		relayRequestsTotal.WithLabelValues(outcome).Add(0)
 	}
