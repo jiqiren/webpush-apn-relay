@@ -15,7 +15,9 @@ or `METRICS_PORT=19100` in the environment (the flag wins if both are set).
 
 The listener is separate from the public relay port and serves only `/metrics`.
 It binds to `127.0.0.1` by default so the public port never exposes internal
-telemetry. A failure to bind is logged and does **not** take the relay down.
+telemetry. Override the address with `-metrics-bind-address` or
+`METRICS_BIND_ADDRESS` (again, the flag wins). A failure to bind is logged and
+does **not** take the relay down.
 
 To scrape from a container, see [Topology](#topology) — loopback will not work.
 
@@ -68,7 +70,8 @@ its own network namespace, so `127.0.0.1` inside Prometheus is Prometheus itself
 Pick one:
 
 1. **Bind the relay publicly and scrape over the network.** Start the relay with
-   `-metrics-bind-address 0.0.0.0` and set the target to the host's LAN address.
+   `-metrics-bind-address 0.0.0.0` (or `METRICS_BIND_ADDRESS=0.0.0.0`) and set
+   the target to the host's LAN address.
    Simplest, but `/metrics` is then reachable from the network — put it behind a
    firewall or a reverse proxy with auth if that is not acceptable.
 2. **Scrape the host from the container.** Keep the relay on loopback and use

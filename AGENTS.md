@@ -207,7 +207,8 @@ Other things that look like failures but are not:
 
 - **Metrics are off by default.** `/metrics` exists only when started with
   `-metrics-port` (or `METRICS_PORT`). It is a separate listener bound to
-  `127.0.0.1` by default, so the public relay port returns 404 for it — that is
+  `127.0.0.1` by default (`-metrics-bind-address` / `METRICS_BIND_ADDRESS`), so
+  the public relay port returns 404 for it — that is
   intentional isolation, not a broken route. A metrics bind failure is logged,
   never fatal. See `observability/README.md`.
 - **`DD_VERSION` is not dead despite the tracer being gone.** It feeds

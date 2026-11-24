@@ -75,6 +75,12 @@ var (
 // answer 413 as before.
 const defaultMaxBodySize = 4096
 
+// defaultMetricsBind is the loopback address the metrics listener binds to when
+// neither -metrics-bind-address nor METRICS_BIND_ADDRESS is given. Named so the
+// flag default and the documented default cannot drift apart; the env fallback
+// itself uses flag.Visit, not a comparison against this value.
+const defaultMetricsBind = "127.0.0.1"
+
 var envVersion = os.Getenv("DD_VERSION")
 
 func userAgent() string {
@@ -97,11 +103,23 @@ func main() {
 	flag.DurationVar(&queueDropTimeout, "queue-drop-timeout", 2*time.Second, "How long to wait for queue space before answering 429 (0 rejects immediately when full)")
 	flag.Int64Var(&maxBodySize, "max-body-size", defaultMaxBodySize, "Reject bodies larger than this many octets (0 accepts any size and lets APNs answer 413)")
 	flag.IntVar(&metricsPort, "metrics-port", 0, "Port to serve Prometheus /metrics on (0 disables)")
-	flag.StringVar(&metricsBind, "metrics-bind-address", "127.0.0.1", "Address to bind the metrics listener to (use 0.0.0.0 to allow remote scrapes)")
+	flag.StringVar(&metricsBind, "metrics-bind-address", defaultMetricsBind, "Address to bind the metrics listener to (use 0.0.0.0 to allow remote scrapes); METRICS_BIND_ADDRESS is equivalent if the flag is omitted")
 	flag.Parse()
+	// flag.Visit reports only flags actually set on the command line, so an
+	// explicit -metrics-bind-address 127.0.0.1 is not mistaken for an omitted
+	// flag and then overridden by the environment. Unlike METRICS_PORT, which
+	// uses 0 as an "unset" sentinel, a bind address has no value that cannot also
+	// be a legitimate choice, hence the visit check.
+	metricsBindSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "metrics-bind-address" {
+			metricsBindSet = true
+		}
+	})
 
-	// METRICS_PORT is honoured only when the flag was left at its default, so
-	// an explicit command-line flag always wins over the container environment.
+	// METRICS_PORT and METRICS_BIND_ADDRESS are honoured only when the
+	// corresponding flag was not given, so an explicit command-line flag always
+	// wins over the container environment.
 	if metricsPort == 0 {
 		if raw := env("METRICS_PORT", ""); raw != "" {
 			if parsed, err := strconv.Atoi(raw); err == nil {
@@ -109,6 +127,11 @@ func main() {
 			} else {
 				log.Warn(fmt.Sprintf("Ignoring invalid METRICS_PORT %q: %s", raw, err))
 			}
+		}
+	}
+	if !metricsBindSet {
+		if raw := env("METRICS_BIND_ADDRESS", ""); raw != "" {
+			metricsBind = raw
 		}
 	}
 

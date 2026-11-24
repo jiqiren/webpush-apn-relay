@@ -109,8 +109,9 @@ you ask for them — the listener is off by default:
 
 `METRICS_PORT=19100` is equivalent; the flag wins if both are set. Metrics are
 served from a separate listener on `127.0.0.1` (override with
-`-metrics-bind-address`) so the public port never exposes them. A metrics
-listener that cannot bind is logged and does not stop the relay.
+`-metrics-bind-address`, or `METRICS_BIND_ADDRESS` for the same precedence rule)
+so the public port never exposes them. A metrics listener that cannot bind is
+logged and does not stop the relay.
 
 See [`observability/`](observability/) for metric definitions, a Prometheus +
 Grafana stack, a dashboard, and suggested alert rules.
