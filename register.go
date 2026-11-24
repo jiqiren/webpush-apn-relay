@@ -20,11 +20,26 @@ package main
 //     `POST /relay-to/{environment}/{token}/{extra...}` pattern cannot match a
 //     two-segment path, so a slash-less endpoint answers 307, and a POST redirect
 //     risks losing Content-Encoding, Crypto-Key, Encryption and Unsubscribe-Url.
+//     Note the precise scope, since it is easy to overstate: the catch-all makes
+//     a missing `{extra}` segment match, so a three-segment endpoint routes with
+//     or without the slash (measured, not inferred). The slash is required for the
+//     two-segment form. It is still emitted in both cases, because the client
+//     contract is one rule and a conditional slash is a worse thing to debug than
+//     a redundant one.
 //
-// Note on tests: this file is compiled into `package main`, whose TestMain
-// requires APNs credentials that no test checkout has. The validation functions
-// here are therefore covered by the black-box tests in register_check_test.go,
-// which builds the same code as a binary and exercises it over HTTP.
+// `extra` is an optional third path segment, forwarded to the device verbatim as
+// the APNs custom field `x` (see handleApnNotification). It exists so a client
+// with several accounts on one device can tell which account a push belongs to
+// without the relay learning anything: the value rides in the URL, so /register
+// remains a pure function of its inputs and the statelessness argument above is
+// unchanged by it. Because the value is interpolated into a path it is matched
+// against a whitelist rather than escaped, and an absent `extra` must keep
+// producing the two-segment endpoint exactly as before - installed clients are
+// holding those URLs.
+//
+// Note on tests: this file is compiled into `package main`, which has no TestMain
+// and does not require APNs credentials to run tests - handlers are exercised in
+// process via httptest in register_test.go. See the comment there.
 
 import (
 	"crypto/ecdh"
@@ -37,6 +52,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -61,6 +77,37 @@ const apnsEnvironmentProduction = "production"
 // relayKeyValue is read once at startup. See relayKey() for what it is for.
 var relayKeyValue = env("RELAY_KEY", "")
 
+// extraPattern is the whitelist validateExtra enforces. Anchored, so it is a
+// whole-value test and not a search; {1,64} bounds the segment length, which also
+// bounds what a sender can put in the APNs payload via the `x` field.
+//
+// The class excludes `/`, `%`, `?`, `#`, `@`, `:` and every non-ASCII codepoint,
+// which closes route injection, double-escaping, fragment/query truncation and
+// percent-escaping in one stroke. It does NOT exclude a value consisting only of
+// dots, which is why extraDotSegmentPattern exists next to it.
+//
+// A const, not a package-level var, so this file keeps exactly one package-scope
+// var - the count TestStatelessnessIsStructural asserts. That guard exists to catch
+// someone adding a device registry; a compiled regexp pattern is not that, and it
+// is not worth teaching the guard about `regexp`. The trade is that MustCompile runs
+// per call instead of at init, which is irrelevant at registration volume.
+const extraPattern = `^[A-Za-z0-9._-]{1,64}$`
+
+// extraDotSegmentPattern rejects the two values the character class above would
+// otherwise allow: a whole value of `.` or `..`. They are the only ones, because
+// the class excludes `/`, so a dot segment can never appear *inside* a value -
+// `a/../b` is already refused for its slashes. Anchors are therefore load-bearing:
+// without them this pattern would also refuse `v1.2` and `acct..1`, which are fine
+// because nothing collapses them.
+//
+// Why refuse them at all if they are only two strings: a `..` extra is not a
+// malformed path, it is a path that means something else by the time it is routed.
+// net/http collapses dot segments before matching, so `/token/../` arrives as
+// `/relay-to/production/` - not a routable path, so the sender gets a 404 and no
+// push is delivered, while /register has answered 200 and the client believes it
+// subscribed. Measured against a real httptest server, not inferred.
+const extraDotSegmentPattern = `^\.{1,2}$`
+
 // registerRequest is the body of POST /register.
 //
 // The field names are camelCase because the client encodes a Swift struct with
@@ -73,6 +120,13 @@ type registerRequest struct {
 	VapidPublicKey string `json:"vapidPublicKey"`
 	ServerURL      string `json:"serverURL"`
 	Environment    string `json:"environment"`
+
+	// Extra is an optional opaque tag echoed to the device as the APNs custom
+	// field `x`. Seloi uses it as an account hint, so a push can be routed to the
+	// right account on a device that hosts several. It is deliberately not
+	// interpreted here - the relay has no use for it and giving it meaning would
+	// mean storing what it maps to.
+	Extra string `json:"extra"`
 }
 
 // unregisterRequest is the body of POST /unregister.
@@ -118,13 +172,40 @@ func handleRegister(writer http.ResponseWriter, request *http.Request) {
 		environment = "development"
 	}
 
+	// Same reasoning as environment above: whitelisted, never sanitised. Unlike
+	// environment, an invalid value is a rejection rather than a fallback - the
+	// client asked for account routing and silently minting an endpoint without
+	// the segment would give it pushes it cannot attribute, which is the failure
+	// this field exists to prevent.
+	extra, err := validateExtra(body.Extra)
+	if err != nil {
+		// Counted as its own outcome instead of the generic register_bad_request
+		// that rejectRegistration records. The sum is what must stay comparable with
+		// the pre-existing series, so this path increments once, not twice.
+		//
+		// The reason it earns a series at all: this is the only validation failure
+		// that is a client format change rather than a broken token, and it fails
+		// quietly - a client sending hints outside the whitelist gets a 400 it may
+		// ignore, and the user simply sees pushes they cannot attribute. An operator
+		// needs a line that climbs.
+		recordRegistration("register_bad_extra")
+		rejectRegistrationOnly(writer, requestLog, "extra", err)
+		return
+	}
+
 	// Built from validated components only, and through url.URL rather than
 	// string concatenation so the host is escaped and a scheme cannot be smuggled
-	// in via the path. The trailing slash is required: see the package comment.
+	// in via the path. The trailing slash is kept in both forms; see the package
+	// comment for what it does and does not protect.
+	path := "/relay-to/" + environment + "/" + token + "/"
+	if extra != "" {
+		path += extra + "/"
+	}
+
 	endpoint := &url.URL{
 		Scheme: "https",
 		Host:   request.Host,
-		Path:   "/relay-to/" + environment + "/" + token + "/",
+		Path:   path,
 	}
 
 	writeJSON(writer, http.StatusOK, registerResponse{
@@ -135,10 +216,13 @@ func handleRegister(writer http.ResponseWriter, request *http.Request) {
 	recordRegistration("register_ok")
 
 	// serverURL is logged because it is the only signal of which instances are
-	// using this relay. It is stored nowhere and dialed by nothing.
+	// using this relay. It is stored nowhere and dialed by nothing. The extra is
+	// logged too: it is client-chosen and opaque, so the only thing it can tell an
+	// operator is that account-hinted registrations are happening at all.
 	requestLog.WithFields(log.Fields{
 		"environment": environment,
 		"server":      serverURL,
+		"extra":       extra,
 	}).Info("registered push endpoint")
 }
 
@@ -192,6 +276,12 @@ func relayKey() string {
 // 400 is correct here and only here: a 4xx in front of Mastodon destroys a Web
 // Push subscription, but /register is called by the iOS client, which has no
 // subscription to lose. The relay path keeps its 5xx rule; see AGENTS.md.
+//
+// rejectRegistration applies the same asymmetry to validation failures, including
+// the one for a rejected `extra`: a caller that asked for an account-hinted
+// endpoint and got a 400 learns about it immediately and can retry with a value
+// inside the whitelist, whereas a 5xx would hide a client bug behind a relay
+// error. That trade is available only on this path.
 func decodeRegistrationJSON(writer http.ResponseWriter, request *http.Request, target any) error {
 	request.Body = http.MaxBytesReader(writer, request.Body, maxRegistrationBodySize)
 
@@ -216,8 +306,47 @@ func decodeRegistrationJSON(writer http.ResponseWriter, request *http.Request, t
 	return err
 }
 
+// validateExtra accepts an optional account hint for the third path segment.
+//
+// Whitelisted rather than sanitised, for the reason that governs every value here:
+// the string becomes a path segment of a URL this service will later route. A
+// slash would add a segment and change what the mux matches; a `%` would
+// double-escape on the way out (url.URL renders a literal `%` as `%25`), so the
+// device would receive something other than what the client registered. The
+// accepted class is what a client actually needs to name an account - ASCII word
+// characters, dot, dash, underscore - and everything else is refused rather than
+// mangled into it.
+//
+// The empty string is "absent", not a zero-length segment: it must keep minting
+// the two-segment endpoint, because installed clients are holding those URLs and
+// a trailing empty segment is a different path to ServeMux.
+func validateExtra(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+
+	if !regexp.MustCompile(extraPattern).MatchString(raw) {
+		return "", fmt.Errorf("extra %q is not 1-64 characters of [A-Za-z0-9._-]", raw)
+	}
+
+	// The character class allows dots, so `.` and `..` pass it; see
+	// extraDotSegmentPattern for why those two are refused anyway.
+	if regexp.MustCompile(extraDotSegmentPattern).MatchString(raw) {
+		return "", fmt.Errorf("extra %q is a dot segment, which net/http collapses before routing", raw)
+	}
+
+	return raw, nil
+}
+
 func rejectRegistration(writer http.ResponseWriter, requestLog *log.Entry, field string, err error) {
 	recordRegistration("register_bad_request")
+	rejectRegistrationOnly(writer, requestLog, field, err)
+}
+
+// rejectRegistrationOnly answers the 400 and logs, without touching a counter.
+// Split out so a caller that has already chosen a more specific outcome cannot
+// count the same request twice.
+func rejectRegistrationOnly(writer http.ResponseWriter, requestLog *log.Entry, field string, err error) {
 	// The reason goes to the log, not the response: echoing a rejected value back
 	// to an unauthenticated caller is a cheap way to learn what passed.
 	requestLog.WithError(err).WithField("field", field).Warn("rejected registration")

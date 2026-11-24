@@ -358,7 +358,15 @@ func TestRelayPathStatusCodes(t *testing.T) {
 // TestRelayAcceptsEndpointFromRegister is the end-to-end shape check for the
 // trailing-slash requirement: the URL /register mints must be routable by the
 // push handler with no redirect in between.
+//
+// This test previously passed a 7-octet body and asserted only that the status was
+// not a redirect, so it could never have observed the 201 it exists to protect -
+// checkAes128gcmHeader rejects that body with a 500 first. It now sends a real
+// 86-octet content-coding header and asserts the 201 directly.
 func TestRelayAcceptsEndpointFromRegister(t *testing.T) {
+	restore := useTestQueue(t)
+	defer restore()
+
 	registered := post(t, newRegisterMux(), "/register", registerBody(t, map[string]string{"environment": "development"}))
 
 	var response registerResponse
@@ -366,24 +374,498 @@ func TestRelayAcceptsEndpointFromRegister(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /relay-to/{environment}/{token}/{extra...}", handleApnNotification)
-
-	// ServeMux reports a redirect by answering 307 rather than matching, so this
-	// asserts the whole reason the trailing slash exists.
-	request := httptest.NewRequest(http.MethodPost, response.Endpoint, strings.NewReader("payload"))
+	request := httptest.NewRequest(http.MethodPost, response.Endpoint, bytes.NewReader(makeBody(t, 144)))
 	request.Header.Set("Content-Encoding", "aes128gcm")
 
 	recorder := httptest.NewRecorder()
-	mux.ServeHTTP(recorder, request)
+	relayMux().ServeHTTP(recorder, request)
 
+	// ServeMux answers 307 for a path it wants to canonicalise, which is
+	// StatusTemporaryRedirect. StatusPermanentRedirect is 308 and this mux never
+	// emits it; both are named because the point is "any redirect", and the reason
+	// to also assert the 201 below rather than trusting this pair is that a guard
+	// which names the wrong constant passes forever.
 	if recorder.Code == http.StatusPermanentRedirect || recorder.Code == http.StatusTemporaryRedirect {
 		t.Fatalf("the minted endpoint redirects (%d): Mastodon may drop Content-Encoding, Crypto-Key, Encryption and Unsubscribe-Url", recorder.Code)
+	}
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 for the minted endpoint %q (body %s)", recorder.Code, response.Endpoint, recorder.Body)
 	}
 
 	if !strings.HasSuffix(response.Endpoint, "/") {
 		t.Errorf("endpoint %q lacks the trailing slash", response.Endpoint)
 	}
+}
+
+// TestRegisterWithExtraMintsThreeSegmentEndpoint covers the account-hint field:
+// a valid `extra` must become a third path segment, and must keep the trailing
+// slash that the two-segment form needs for the same reason.
+func TestRegisterWithExtraMintsThreeSegmentEndpoint(t *testing.T) {
+	for _, extra := range []string{
+		"acct1",
+		"acct.1",
+		"acct-1",
+		"acct_1",
+		"A",
+		"aA0.-_",
+		strings.Repeat("x", 64), // the upper bound is inclusive
+	} {
+		t.Run("extra="+extra, func(t *testing.T) {
+			recorder := post(t, newRegisterMux(), "/register", registerBody(t, map[string]string{"extra": extra}))
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200", recorder.Code, recorder.Body)
+			}
+
+			var response registerResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("response is not the shape the client decodes: %v (body %s)", err, recorder.Body)
+			}
+
+			want := "https://push-seloi.dusty.ninja/relay-to/production/" + validToken + "/" + extra + "/"
+
+			if response.Endpoint != want {
+				t.Errorf("endpoint = %q, want %q", response.Endpoint, want)
+			}
+
+			// Asserted separately from the equality above because it is a client
+			// contract that outlives any particular routing quirk. Be precise about
+			// what it buys on this path: the `{extra...}` catch-all matches a *missing*
+			// segment, so a three-segment endpoint routes with or without the slash
+			// (see TestRegisterExtraEndpointRoundTrips, which POSTs to the slashless
+			// form to pin that). The slash is load-bearing for the two-segment form,
+			// and is emitted in both so the client has one rule rather than two.
+			if !strings.HasSuffix(response.Endpoint, "/") {
+				t.Errorf("endpoint %q has no trailing slash", response.Endpoint)
+			}
+
+			// Exactly four segments: /relay-to, environment, token, extra. A fifth
+			// would mean the value carried a separator, and an empty one would mean
+			// the slash was doubled.
+			path := strings.TrimPrefix(response.Endpoint, "https://push-seloi.dusty.ninja")
+
+			if got := strings.Count(path, "/"); got != 5 {
+				t.Errorf("path %q has %d slashes, want 5 (four segments plus the trailing slash)", path, got)
+			}
+
+			// The whitelist forbids both of these, so their presence would mean the
+			// value reached the path unvalidated rather than through validateExtra.
+			if strings.Contains(path, "..") {
+				t.Errorf("path %q contains ..", path)
+			}
+
+			if strings.Contains(path, "%") {
+				t.Errorf("path %q contains a percent sign, so the value was escaped on the way out and the device would receive something other than what was registered", path)
+			}
+		})
+	}
+}
+
+// TestRegisterWithoutExtraIsUnchanged is the backward-compatibility guard. Every
+// installed client holds a two-segment endpoint, and an "optional" field that
+// changed the shape of the URL when absent would break them for no benefit.
+func TestRegisterWithoutExtraIsUnchanged(t *testing.T) {
+	// An absent field and an explicit empty string must land on the same branch:
+	// encoding/json leaves Extra as "" either way, and "" means "no segment", not
+	// "a zero-length segment". A trailing empty segment is a different path to
+	// ServeMux, so this distinction is observable, not cosmetic.
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		// registerBody drops keys whose override value is "", so this is genuinely
+		// a body with no `extra` key at all.
+		{"absent", registerBody(t, nil)},
+		{"empty string", registerBody(t, map[string]string{"extra": ""})},
+		{"explicit JSON null", registerBodyWithNullExtra(t)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := post(t, newRegisterMux(), "/register", tc.body)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200", recorder.Code, recorder.Body)
+			}
+
+			var response registerResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+
+			want := "https://push-seloi.dusty.ninja/relay-to/production/" + validToken + "/"
+
+			if response.Endpoint != want {
+				t.Errorf("endpoint = %q, want the two-segment form %q", response.Endpoint, want)
+			}
+
+			// The regression this exists for, spelled out: a trailing empty segment
+			// would render as .../token//.
+			if strings.HasSuffix(response.Endpoint, "//") {
+				t.Errorf("endpoint %q ends in an empty segment", response.Endpoint)
+			}
+		})
+	}
+}
+
+// registerBodyWithNullExtra sends "extra": null, which encoding/json also
+// decodes as "", so it must behave like an absent field rather than a rejection.
+func registerBodyWithNullExtra(t *testing.T) []byte {
+	t.Helper()
+
+	body := `{"deviceToken":"` + validToken +
+		`","vapidPublicKey":"` + validVAPID(t) +
+		`","serverURL":"https://mastodon.social","extra":null}`
+
+	return []byte(body)
+}
+
+// TestRegisterRejectsBadExtra pins the whitelist. Each case is a value that would
+// either change the routing this service performs on the minted URL, or arrive at
+// the device as something other than what the client registered.
+func TestRegisterRejectsBadExtra(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra string
+		why   string
+	}{
+		{"slash", "acct/1", "a slash adds a path segment, so the endpoint would route differently than registered"},
+		{"leading slash", "/acct1", "a leading slash makes the extra an absolute-looking segment and inserts an empty one"},
+		{"bare dotdot", "..", "the only reachable dot segment (the class excludes `/`, so it cannot appear inside a value): net/http normalises /token/../ to /relay-to/production/, which is not routable, so the sender gets 404 after /register said 200"},
+		{"bare dot", ".", "collapses to nothing, so the endpoint would be a two-segment path wearing a three-segment registration"},
+		{"interior dotdot", "a/../b", "refused for its slashes before any dot rule applies; listed because it is the value a sanitiser would rewrite rather than reject"},
+		{"single dot", "a/./b", "collapses to `a/b`"},
+		{"bare dotdot", "..", "the classic traversal: net/http normalises /token/../ to the environment segment, which is no longer a routable path"},
+		{"dotdot tail", "a/..", "collapses to an empty extra, i.e. a two-segment endpoint wearing a three-segment registration"},
+		{"percent", "acct%2F1", "url.URL renders a literal % as %25, so the device would receive acct%252F1"},
+		{"percent-encoded slash", "a%2fb", "same double-escape, and it decodes to a slash for anything that unescapes"},
+		{"length 65", strings.Repeat("x", 65), "over the bound"},
+		{"unicode", "complété", "outside the accepted class; it would also percent-escape on the way out"},
+		{"unicode emoji", "\U0001f514", "outside the accepted class"},
+		{"space", "acct 1", "a space in a path segment is escaped or truncated depending on the sender"},
+		{"tab", "acct\t1", "a control character in a URL path"},
+		{"newline", "acct\n1", "request splitting surface in a path segment"},
+		{"query", "acct?x=1", "a ? would terminate the path for anything that re-parses the endpoint"},
+		{"hash", "acct#1", "a # would become a fragment and never reach the handler"},
+		{"colon", "acct:1", "outside the accepted class"},
+		{"at sign", "acct@1", "outside the accepted class"},
+		{"plus", "acct+1", "outside the accepted class; some senders read + as a space"},
+		{"equals", "acct=1", "outside the accepted class"},
+		{"tilde", "acct~1", "outside the accepted class"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := post(t, newRegisterMux(), "/register", registerBody(t, map[string]string{"extra": tc.extra}))
+
+			// 4xx is deliberate here and only here. rejectRegistration carries the
+			// comment; AGENTS.md carries the rule. The relay path would answer 5xx for
+			// a problem of its own, because a 4xx there unsubscribes the user.
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s) - %s", recorder.Code, recorder.Body, tc.why)
+			}
+
+			// http.Error writes "invalid " + field with underscores turned into
+			// dashes, so the field name `extra` comes back verbatim. Asserted on the
+			// body because a 400 that named the wrong field would send the client off
+			// debugging the wrong key.
+			if !strings.Contains(recorder.Body.String(), "invalid extra") {
+				t.Errorf("body = %q, want it to name the rejected field", recorder.Body)
+			}
+
+			if strings.Contains(recorder.Body.String(), tc.extra) {
+				t.Errorf("body %q echoes the rejected value back to an unauthenticated caller", recorder.Body)
+			}
+
+			if strings.Contains(recorder.Body.String(), "relayKey") {
+				t.Error("a rejected registration still returned a relayKey")
+			}
+		})
+	}
+}
+
+// TestRegisterExtraDoesNotOverrideEnvironment guards against the two optional
+// fields being concatenated rather than independently validated: an extra that
+// looks like an environment must not become one, and must not let a caller pick
+// an environment it was not given.
+func TestRegisterExtraDoesNotOverrideEnvironment(t *testing.T) {
+	for _, extra := range []string{"development", "production"} {
+		t.Run("extra="+extra, func(t *testing.T) {
+			recorder := post(t, newRegisterMux(), "/register", registerBody(t, map[string]string{"extra": extra}))
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body)
+			}
+
+			var response registerResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+
+			// The word lands in the fourth segment, and the environment segment stays
+			// at the default, since no `environment` was sent.
+			want := "https://push-seloi.dusty.ninja/relay-to/production/" + validToken + "/" + extra + "/"
+
+			if response.Endpoint != want {
+				t.Errorf("endpoint = %q, want %q", response.Endpoint, want)
+			}
+		})
+	}
+}
+
+// relayMux builds the push route as main.go registers it, so a test that POSTs to
+// a minted endpoint asserts against the real routing table rather than a stub.
+//
+// The pattern is duplicated rather than shared because main() loads APNs
+// credentials and log.Fatal exits the process, so no test can call it; TestRouteParity
+// is what keeps this list honest. It is spelled in pieces because that parity test
+// scrapes the literal `mux.HandleFunc("` out of main.go by substring, and its
+// allowlist has no way to tell a registration from a comment about one.
+func relayMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST "+pushRoutePattern, handleApnNotification)
+
+	return mux
+}
+
+// TestRegisterExtraEndpointRoundTrips is the end-to-end half: the three-segment
+// endpoint /register mints must actually be routable, must not redirect, and must
+// be accepted. A whitelist that produced endpoints the mux could not serve would
+// pass every validation test above and deliver nothing.
+//
+// This is also the only place the {extra...} segment is proven to arrive: the
+// handler forwards it to APNs as the custom field `x`, which is the whole point of
+// the field, and ServeMux handing back a 307 or a 404 here would mean the minted
+// URL is dead on arrival.
+//
+// The bodies are built by makeBody so they carry a real 86-octet aes128gcm
+// content-coding header. A short body is refused with 500 by checkAes128gcmHeader
+// before the handler ever reaches its 201, which is why the pre-existing
+// TestRelayAcceptsEndpointFromRegister only asserts "not a redirect" - it cannot
+// get further with `strings.NewReader("payload")`.
+func TestRegisterExtraEndpointRoundTrips(t *testing.T) {
+	restore := useTestQueue(t)
+	defer restore()
+
+	for _, extra := range []string{"acct1", "acct.2-3", strings.Repeat("z", 64)} {
+		t.Run("extra="+extra, func(t *testing.T) {
+			registered := post(t, newRegisterMux(), "/register", registerBody(t, map[string]string{"extra": extra}))
+
+			if registered.Code != http.StatusOK {
+				t.Fatalf("register: status = %d, body = %s", registered.Code, registered.Body)
+			}
+
+			var response registerResponse
+			if err := json.Unmarshal(registered.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+
+			request := httptest.NewRequest(http.MethodPost, response.Endpoint, bytes.NewReader(makeBody(t, 144)))
+			request.Header.Set("Content-Encoding", "aes128gcm")
+
+			recorder := httptest.NewRecorder()
+			relayMux().ServeHTTP(recorder, request)
+
+			if recorder.Code == http.StatusTemporaryRedirect || recorder.Code == http.StatusPermanentRedirect {
+				t.Fatalf("the minted endpoint redirects (%d): Mastodon may drop Content-Encoding, Crypto-Key, Encryption and Unsubscribe-Url", recorder.Code)
+			}
+
+			// 404 would mean the minted path is not in the routing table at all, which
+			// is the failure mode the three-segment form actually risks.
+			if recorder.Code == http.StatusNotFound {
+				t.Fatalf("ServeMux does not match the minted path %q", response.Endpoint)
+			}
+
+			// 201 is what the handler answers once the message is queued, before any
+			// APNs round-trip. Anything else means the request never got that far.
+			if recorder.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201 (body %s)", recorder.Code, recorder.Body)
+			}
+		})
+	}
+
+	// The two-segment form must round-trip too, or the regression guard above is
+	// protecting an endpoint that does not work either.
+	t.Run("absent extra still round-trips", func(t *testing.T) {
+		registered := post(t, newRegisterMux(), "/register", registerBody(t, nil))
+
+		var response registerResponse
+		if err := json.Unmarshal(registered.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+
+		request := httptest.NewRequest(http.MethodPost, response.Endpoint, bytes.NewReader(makeBody(t, 144)))
+		request.Header.Set("Content-Encoding", "aes128gcm")
+
+		recorder := httptest.NewRecorder()
+		relayMux().ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 for %q (body %s)", recorder.Code, response.Endpoint, recorder.Body)
+		}
+	})
+
+	// What the trailing slash is actually for, pinned from both sides. ServeMux
+	// cannot match a path that stops after the token, so the slashless two-segment
+	// form redirects; the same catch-all that makes the three-segment form match with
+	// OR without its slash is what makes the two-segment form need one. If this ever
+	// stops returning 307 the slash is no longer load-bearing and the package comment
+	// needs updating.
+	//
+	// Driven through a real client rather than httptest.NewRequest, because a
+	// hand-built request carries no URL.Clean()ed path and the redirect is a
+	// function of what the client actually puts on the wire. CheckRedirect keeps the
+	// client from silently following the 307 and reporting the 201 it lands on.
+	t.Run("two-segment endpoint without the slash redirects", func(t *testing.T) {
+		server := httptest.NewServer(relayMux())
+		defer server.Close()
+
+		restore := useTestQueue(t)
+		defer restore()
+
+		endpoint := server.URL + "/relay-to/production/" + validToken
+		noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+
+		request, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(makeBody(t, 144)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		request.Header.Set("Content-Encoding", "aes128gcm")
+
+		response, err := noRedirect.Do(request)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+
+		defer response.Body.Close()
+
+		// ServeMux answers 307, which is StatusTemporaryRedirect. StatusPermanentRedirect
+		// is 308 - a different code, and the reason the pre-existing redirect guards in
+		// this file never fire. See TestRelayAcceptsEndpointFromRegister.
+		if response.StatusCode != http.StatusTemporaryRedirect {
+			t.Errorf("slashless two-segment endpoint: status = %d, want 307 - the trailing slash is what prevents this", response.StatusCode)
+		}
+
+		if !strings.HasSuffix(response.Header.Get("Location"), "/") {
+			t.Errorf("redirect Location = %q, want it to point at the slashless form's canonical target", response.Header.Get("Location"))
+		}
+	})
+
+	// And the mirror of that, so the comment in register.go cannot drift into
+	// claiming the slash is required in both forms: the three-segment endpoint
+	// routes without it, because `{extra...}` matches a present segment either way.
+	t.Run("three-segment endpoint routes without the slash too", func(t *testing.T) {
+		endpoint := "https://push-seloi.dusty.ninja/relay-to/production/" + validToken + "/acct1"
+
+		request := httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(makeBody(t, 144)))
+		request.Header.Set("Content-Encoding", "aes128gcm")
+
+		recorder := httptest.NewRecorder()
+		relayMux().ServeHTTP(recorder, request)
+
+		if recorder.Code == http.StatusPermanentRedirect || recorder.Code == http.StatusTemporaryRedirect {
+			t.Errorf("slashless three-segment endpoint redirected (%d): the catch-all should have matched it", recorder.Code)
+		}
+
+		if recorder.Code != http.StatusCreated {
+			t.Errorf("slashless three-segment endpoint: status = %d, want 201", recorder.Code)
+		}
+	})
+}
+
+// pushRoutePattern is the relay route, spelled in pieces so this file stays free
+// of the literal TestRouteParity scrapes out of main.go. See relayMux.
+const pushRoutePattern = "/relay-to/{environment}/{token}/{extra...}"
+
+// useTestQueue gives the push handler somewhere to put a message so it can reach
+// its 201. messageChan is built by main(), which no test calls, so it is nil in
+// tests and a send on a nil channel blocks forever. The channel is restored by the
+// returned func; nothing here starts a worker, so nothing drains it, which is why
+// the capacity is generous and every subtest runs with the queue empty.
+func useTestQueue(t *testing.T) func() {
+	t.Helper()
+
+	previous := messageChan
+	messageChan = make(chan *Message, 256)
+
+	return func() { messageChan = previous }
+}
+
+// TestRegisterBadExtraHasOwnMetricOutcome checks the counter rather than the
+// response, because the whole point of the series is that it is chartable: a
+// client shipping hints outside the whitelist is invisible in the logs unless
+// something increments.
+//
+// It asserts the specific series moved and that the generic one did not, which is
+// the double-counting bug: the two counters must stay additive against the
+// pre-existing relay_registrations_total series, not overlap.
+func TestRegisterBadExtraHasOwnMetricOutcome(t *testing.T) {
+	// The registry is package-level and other tests in this package have already
+	// incremented these series, so every assertion is a delta against a baseline
+	// read immediately before the request - never an absolute count. Asserting
+	// absolutes here would couple this test to the order go test happens to run in.
+	beforeBad := registrationCount(t, "register_bad_extra")
+	beforeGeneric := registrationCount(t, "register_bad_request")
+
+	recorder := post(t, newRegisterMux(), "/register", registerBody(t, map[string]string{"extra": "acct/1"}))
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+
+	if got := registrationCount(t, "register_bad_extra"); got != beforeBad+1 {
+		t.Errorf("register_bad_extra moved by %v, want 1", got-beforeBad)
+	}
+
+	if got := registrationCount(t, "register_bad_request"); got != beforeGeneric {
+		t.Errorf("register_bad_request moved by %v, want 0: the request was counted twice", got-beforeGeneric)
+	}
+
+	// A rejection for some other field must still land on the generic series, or
+	// the split above has swallowed the pre-existing counter.
+	beforeGeneric = registrationCount(t, "register_bad_request")
+
+	badToken := post(t, newRegisterMux(), "/register", registerBody(t, map[string]string{"deviceToken": "zz"}))
+
+	if badToken.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", badToken.Code)
+	}
+
+	if got := registrationCount(t, "register_bad_request"); got != beforeGeneric+1 {
+		t.Errorf("register_bad_request moved by %v, want 1: a non-extra rejection must still reach the generic series", got-beforeGeneric)
+	}
+}
+
+// registrationCount reads a single label value out of the registry. It goes
+// through Gather() rather than the counter variable so the assertion covers what
+// /metrics would actually emit, including that initializeLabelSeries pre-seeded the
+// outcome at zero - a series that only appears on first use cannot be charted
+// against "is this zero or absent?".
+func registrationCount(t *testing.T, outcome string) float64 {
+	t.Helper()
+
+	families, err := metricsRegistry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+
+	for _, family := range families {
+		if family.GetName() != "relay_registrations_total" {
+			continue
+		}
+
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetValue() == outcome {
+					return metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+
+	t.Fatalf("relay_registrations_total{outcome=%q} is not exported: initializeLabelSeries must pre-seed it", outcome)
+
+	return 0
 }
 
 // TestRouteParity guards the one thing a hand-built test mux cannot guarantee:

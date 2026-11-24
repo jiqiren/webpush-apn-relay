@@ -163,7 +163,10 @@ the wrong direction:
 
 `/register` may answer `4xx` for a malformed body because the caller is the iOS
 client with no subscription to lose. This is the **only** place that is true; the
-relay path keeps the `5xx` rule. `serverURL` is validated but stored nowhere and
+relay path keeps the `5xx` rule. A rejected `extra` follows it — `400` plus the
+`register_bad_extra` outcome — because a client that asked for account routing and
+was silently given an endpoint without the segment would receive pushes it cannot
+attribute, which is a worse failure than a `400` it can act on. `serverURL` is validated but stored nowhere and
 dialed by nothing, so it is not an SSRF surface today — if that ever changes, the
 caller-controlled value must also be blocked from private, loopback and link-local
 ranges.

@@ -185,7 +185,8 @@ For clients that cannot build the endpoint URL on their own. Request body, with
   "deviceToken": "<hex APNs device token>",
   "vapidPublicKey": "<base64url uncompressed P-256 key>",
   "serverURL": "https://mastodon.social",
-  "environment": "production"
+  "environment": "production",
+  "extra": "acct1"
 }
 ```
 
@@ -198,11 +199,31 @@ Response, `200` with `Content-Type: application/json`:
 }
 ```
 
-The returned `endpoint` always carries a trailing slash. That is not cosmetic:
-the push route's `{extra...}` pattern cannot match a two-segment path, so a
-slash-less endpoint answers `307`, and a redirected `POST` risks losing
-`Content-Encoding`, `Crypto-Key`, `Encryption`, `TTL`, `Urgency` and
-`Unsubscribe-Url`.
+`extra` is optional and becomes a third path segment, so the endpoint is
+`.../production/<token>/acct1/` instead of `.../production/<token>/`. Whatever is
+in that segment is forwarded to the device verbatim as the APNs custom field `x`,
+which is how a client with several accounts on one device tells which account a
+push belongs to. The relay gives the value no meaning and stores nothing about it
+— it rides in the URL, so `/register` stays a pure function of its inputs.
+
+An absent or empty `extra` produces the two-segment endpoint exactly as before,
+which matters because installed clients are holding those URLs. The value is
+whitelisted to `^[A-Za-z0-9._-]{1,64}$` and additionally refused if it is `.` or
+`..`, because it is interpolated into a path: a slash would change what the mux
+matches, a `%` would double-escape on the way out, and a `..` is collapsed by
+net/http before routing, so `/token/../` arrives as `/relay-to/production/` — a
+`404` for the sender after `/register` answered `200` (measured against a real
+server). It is rejected rather than sanitised for the same reason as every other
+field here.
+
+The returned `endpoint` always carries a trailing slash. For the two-segment form
+that is not cosmetic: the push route's `{extra...}` pattern cannot match a
+path that stops after the token, so a slash-less endpoint answers `307`, and a
+redirected `POST` risks losing `Content-Encoding`, `Crypto-Key`, `Encryption`,
+`TTL`, `Urgency` and `Unsubscribe-Url`. An `extra` segment makes the catch-all
+match with or without the slash, so the three-segment form does not strictly need
+one — it is emitted anyway, so the client has a single rule instead of one that
+depends on whether it passed `extra`.
 
 `relayKey` is always present and never null, because the iOS client decodes it as
 a required `String` - omitting it makes the client's JSON decoder throw *after* a

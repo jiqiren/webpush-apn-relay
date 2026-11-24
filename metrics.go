@@ -163,7 +163,7 @@ func initializeLabelSeries() {
 	}
 
 	for _, outcome := range []string{
-		"register_ok", "register_bad_request", "register_body_too_large", "unregister_ok",
+		"register_ok", "register_bad_request", "register_bad_extra", "register_body_too_large", "unregister_ok",
 	} {
 		registrationsTotal.WithLabelValues(outcome).Add(0)
 	}
